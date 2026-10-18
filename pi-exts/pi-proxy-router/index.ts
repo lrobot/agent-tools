@@ -19,11 +19,30 @@ import type {
   SimpleStreamOptions,
   StreamOptions,
 } from "@earendil-works/pi-ai";
-// Bun aliases the bare specifier "undici" to its builtin module
-// (require.resolve("undici") returns "node:undici" under Bun), and that
-// builtin fetch cannot drive our ProxyAgent — proxied requests die with
-// "Unable to connect" / ECONNRESET. Load the npm copy explicitly by path.
-// Note: require("undici/package.json") still resolves through node_modules.
+// ── 为什么不能直接 `import ... from "undici"` ─────────────────────────
+//
+// 这个扩展运行在 pi 进程内，pi 是 Bun 编译的二进制，而 Bun 会把 bare
+// specifier "undici" 别名到自己的内置模块：在 pi 进程里
+// `require.resolve("undici")` 返回的是字符串 "node:undici"，根本不是
+// node_modules 里的 npm 包。于是 import 进来的 `fetch` / `ProxyAgent`
+// 是 Bun 内置副本——内置 fetch 不会把 init.dispatcher 交给 npm 的
+// ProxyAgent 使用，代理被静默忽略，请求退化为直连，被墙的域名
+// （chatgpt.com 等）立刻被 RST，表现为 "Unable to connect" 或
+// ECONNRESET（The socket connection was closed unexpectedly）。
+//
+// 两个排查时容易踩的坑：
+// 1. `require("undici/package.json")` 不受影响，仍按 node_modules 解析。
+//    所以打印版本号得到的是 npm 包版本（如 7.30.1），会误以为加载的
+//    就是 npm 包——version 日志具有欺骗性。
+// 2. 在 CLI Bun 下用 `import "undici"` 做对照实验同样命中别名，必须
+//    用显式文件路径 import 才能测到 npm 包；且 CLI Bun（1.4.2）与 pi
+//    内嵌 Bun（1.3.14）行为不同，孤立实验测不出 pi 内的问题。
+//
+// 解决办法：package.json 子路径（"undici/package.json"）的解析不受
+// builtin 别名影响，先定位到 npm 包真实目录，再对该目录做 require——
+// 目录/文件路径加载是纯文件操作，Bun 不会拦截。undici v7 是 CJS
+//（无 "type":"module"），require 即可。这样修复只依赖源码和
+// package.json 声明的版本（^7.0.0），node_modules 删了重装功能不丢。
 const undiciDir = dirname(require.resolve("undici/package.json"));
 const undiciMod: typeof import("undici") = require(undiciDir);
 const {
