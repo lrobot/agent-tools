@@ -19,17 +19,24 @@ import type {
   SimpleStreamOptions,
   StreamOptions,
 } from "@earendil-works/pi-ai";
-import {
+// Bun aliases the bare specifier "undici" to its builtin module
+// (require.resolve("undici") returns "node:undici" under Bun), and that
+// builtin fetch cannot drive our ProxyAgent — proxied requests die with
+// "Unable to connect" / ECONNRESET. Load the npm copy explicitly by path.
+// Note: require("undici/package.json") still resolves through node_modules.
+const undiciDir = dirname(require.resolve("undici/package.json"));
+const undiciMod: typeof import("undici") = require(undiciDir);
+const {
   Agent,
-  fetch as undiciFetch,
+  fetch: undiciFetch,
   getGlobalDispatcher,
   ProxyAgent,
   setGlobalDispatcher,
-  type Dispatcher,
-} from "undici";
+} = undiciMod;
+type Dispatcher = import("undici").Dispatcher;
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SocksDispatcher } from "./socks-dispatcher.ts";
 
 // 日志开关：默认静默（console 输出会污染 pi 的 TUI 输入框）。
