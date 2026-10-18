@@ -1,0 +1,323 @@
+# pi-multi-account
+
+Automatic multi-account failover & rotation for [Pi Agent](https://pi.dev/), across **Anthropic (Claude)**, **native OpenAI / ChatGPT and legacy Codex**, **Kimi For Coding**, **Cursor**, **Qwen / Alibaba**, and **Ollama**.
+
+When the account you are using hits a quota or rate limit, `pi-multi-account` transparently switches to the next authenticated account/model and (optionally) resumes the interrupted task — so a long agent run does not die just because one account ran out of budget.
+
+## What it does
+
+- **Auto-discovers** every authenticated account from `~/.pi/agent/auth.json` (Anthropic Claude Pro/Max, native OpenAI ChatGPT OAuth, legacy Codex, Kimi For Coding, Cursor, Qwen/Alibaba, and Ollama) and builds the failover rotation dynamically — no manual config editing.
+- **Grows the rotation on login.** Run `/login`, choose the subscription/account option, then select a numbered slot such as `anthropic-account-3`, native `openai-account-2` or legacy `openai-codex-account-5`. The next discovery sweep adds it to the rotation automatically.
+- **Supports native Sign in with ChatGPT separately from Codex** on hosts exposing the new OAuth Provider contract (tested on Pi 0.99.2, 1.0.0 and 1.1.0). Issued client/scopes, native Responses models and image/tool behavior are retained. Subscription aliases never inherit ambient paid OpenAI keys; their quota remains unknown until a new-grant endpoint is verified.
+- **Pins a preferred model per account group.** `/multi-account pin provider/model` persists a routing preference across sibling accounts; `unpin` removes it and `pins` explains its current applicability. It never changes the current model, Pi's registry, cooldowns, startup defaults, or automatic quality-band rules.
+- **Auto-discovers new Codex models per account.** At session start (and on `reload` / `rediscover`) it reads OpenAI's authenticated model catalog, mirrors each account's actually available models onto its Pi alias, and follows OpenAI's server priority. A new flagship can therefore win immediately without an extension release or a hard-coded model id.
+- **Handles auth failures without poisoning healthy OAuth accounts.** A generic final 401 briefly cools down a refreshable account and moves the current task forward. Explicit provider verdicts such as `authentication token has been invalidated` force an early refresh; if the refresh token is dead too, the slot is removed and Pi prints the interactive `/login` recovery steps.
+- **Fails over on quota / rate-limit** (429 / 402 / 403 and friends): the exhausted account gets bounded retry backoff and Pi first tries another account with the same model. The provider's reported reset estimate is displayed separately; a short recheck delay does not mean quota will recover then. An actual inference refusal survives restarts and cannot be cleared by a contradictory `allowed: true` usage snapshot during backoff. If it must leave the family, it preserves the model's quality band — Sol/Opus/other frontier flagships stay frontier; Terra/Sonnet stay balanced; Luna/Haiku stay fast — and keeps the session's thinking level. A fresh provider verdict of `blocked` or 100% is skipped automatically instead of wasting the turn; manual `next` remains an explicit one-attempt override for stale telemetry.
+- **Optional immediate auto-continue**: resumes the interrupted turn after a switch from the last safe point. A continuation that exhausts its newly selected account keeps advancing instead of stopping after the first hop. Temporary 5xx/overload errors and Cursor stalls retry the exact selected provider/account/model, without marking its quota exhausted. After four failed attempts (or an earlier recovery breaker), automatic retries stop with an explicit explanation; temporary errors never authorize a switch. Same-route retries are labelled as retries, not fake switches. A rejected Pi follow-up remains armed instead of losing the task. A failed or cancelled automatic compaction still continues the task instead of leaving the session parked in Working, except a terminal content-policy denial or a Daybreak verification outage that exhausts its bounded same-route retry budget: those preserve history and settle automatic continuation until genuine new input/manual control.
+- **Never hides a fresh user message in a private cooldown queue.** If no account is ready, the message remains in Pi's visible transcript and Pi owns its normal delivery/retry path.
+- **Session-bound overnight resume, independently configurable**: if every compatible account is cooling down, the live Pi session keeps the task armed by default even when ordinary post-switch `autoContinue` is off. It polls every account (quota monitoring remains active when the footer is hidden) and re-evaluates eligible routes at bounded retry boundaries. Positive usage metadata is not proof of working inference; a selected route still needs a real attempt, which may fail. A new user message, `/multi-account stop`, session exit, or Esc during a running turn cancels the chain.
+- **Deduplicates provably identical accounts** so duplicate Codex workspace memberships and identical credentials do not consume multiple rotation slots or get separate cooldowns. Different users in one Team/Business workspace remain distinct. New provable duplicate logins are rejected before the redundant slot is saved.
+- **Keeps YOUR reasoning level across automatic switches.** Whatever the session runs at — your Pi default, `/thinking`, or a per-agent `--thinking low` — is preserved and restored after every account/model switch, so it never drifts downward when a weaker fallback model clamps it. Manual `/model` selections adopt Pi's per-model thinking default in `auto` mode; an explicit CLI `--thinking` or forced `reasoningLevel` remains authoritative. The extension does not otherwise override your level, and extreme levels such as `xhigh` / Max / Ultra are never forced.
+- **Shows live limits for the active account** in Pi's footer: remaining 5-hour/session and weekly allowance plus reset countdowns for Codex, Anthropic, and Ollama Cloud accounts, SuperGrok / xAI subscription credit usage for `/login xai` OAuth (not Cursor Grok, not `XAI_API_KEY`), and GLM Coding Plan CN 5-hour/weekly credit quota for `zai-coding-cn`. GLM CN uses the raw Coding Plan API key only at `https://open.bigmodel.cn/api/monitor/usage/quota/limit`; global `zai` keys are not sent there. Missing or malformed quota is unknown, never assumed unused.
+
+## Install
+
+```bash
+pi install npm:pi-multi-account
+```
+
+Restart Pi or run `/reload` after installation.
+
+Requires Node 22+ and Agent Pi / pi-ai **>=0.85.1, <0.88.0; >=0.99.0, <0.100.0; or >=1.0.0, <2.0.0**.
+CI covers Pi **0.85.1, 0.86.1, 0.87.1, 0.99.2, 1.0.0 and 1.1.0**; Pi 0.99+ requires Node >=22.19.0.
+The **unreleased 1.25.0 source** implements native `openai-account-N` ChatGPT OAuth (#92) when the running host exposes that contract; Pi **0.99.2, 1.0.0 and 1.1.0** expose it. Hosts **0.85.1, 0.86.1 and 0.87.1** remain loadable but do not advertise the new login. Legacy `openai-codex` is separate and unchanged. See [native ChatGPT setup and billing boundaries](docs/openai-chatgpt-accounts.md); source implementation does not mean npm publication, host upgrade or current-process adoption.
+Both Pi SDK packages are peers supplied by the running host. OAuth, catalogs and transports
+use public host-bound imports; do not install a private runtime pi-ai copy alongside this extension.
+Standalone SDK callers must supply matching Pi SDK versions. Pi 0.99+ support retains numbered
+account aliases and existing rotation/continuation semantics; it does not introduce a virtual model.
+Pi-owned virtual selections and image/classifier models are not account chat failover targets.
+
+This release does not arbitrate multiple extensions calling `pi.setModel`. Keep one automatic
+foreground selection owner: independent routing extensions can otherwise overwrite each other's
+choices. Account failover still owns ordinary selected chat accounts; virtual models remain host-owned.
+
+Kimi OAuth spares remain available in `/login`, but are not written to `models.json`: without a
+Kimi child OAuth proxy those aliases would be resolvable but unauthenticated. Only real API-key
+Kimi slots are published for extension-free children. Existing user entries are not deleted;
+a previously generated unused Kimi alias can be removed from `models.json` and will not reappear.
+
+> **Anthropic (Claude Pro/Max) works out of the box.** OAuth login and request
+> shaping for the base `anthropic` provider and every `anthropic-account-*` alias
+> are built in — no separate `pi-anthropic-auth` install is required. If you
+> already have `pi-anthropic-auth`, the two coexist safely (the shaping is
+> idempotent). OpenAI Codex / ChatGPT and Qwen accounts work as well.
+
+### Recommended setting
+
+Set Pi provider-level retries to zero so the SDK does not keep retrying an exhausted account before failover kicks in. Pi's separate agent-level retry loop may remain enabled: the extension cancels its pending wake if that retry succeeds. Repeated temporary failures get bounded recovery on the same route, then an explicit stop—not provider failover. In `~/.pi/agent/settings.json`:
+
+```json
+{ "retry": { "provider": { "maxRetries": 0 } } }
+```
+
+## Usage
+
+Add accounts by opening the login picker:
+
+```text
+/login
+Use a subscription
+ChatGPT Plus/Pro (Codex openai-codex-account-2)
+/multi-account rediscover
+```
+
+Pi 0.79.3 does not accept a provider argument after `/login`; select the account
+slot from the interactive provider picker instead.
+
+Check what's in the rotation at any time:
+
+```text
+/multi-account status
+```
+
+Force-refresh and display detailed limits for the active account:
+
+```text
+/multi-account limits refresh
+```
+
+Example status output:
+
+```text
+pi-multi-account: enabled · auto-discover ON
+Current: anthropic/claude-opus-4-8
+Current limits: Claude | 5h 0% left/2h14m | 7d 92% left/1d18h
+Rotation (3): anthropic → openai-codex → openai-codex-account-2
+Registered login slots: anthropic-account-2, openai-codex-account-2
+Cooldowns: none
+Invalidated (need re-login): none
+Pending auto-resume: none
+```
+
+### Commands
+
+All three names are aliases for the same command: `/multi-account`, `/provider-failover`, `/failover`.
+
+| Subcommand | Description |
+|---|---|
+| `status` (default) | Show enabled state, current model, rotation, login slots, cooldowns, invalidations, pending resume. |
+| `limits [refresh]` | Show active-account session/weekly limits; `refresh` bypasses the cache. Aliases: `usage`, `quota`. |
+| `accounts [refresh]` | List every configured slot with provider-reported alias/email, plan, limits, and live routing status. Uses cached metadata unless `refresh` is explicit. |
+| `rediscover` | Force a re-scan of `auth.json`, rebuild the rotation, and refresh Codex model catalogs now. |
+| `add [anthropic\|openai\|codex\|kimi\|cursor\|ollama\|qwen]` | Print the next free account slot to select from the interactive `/login` picker. `openai` means new native ChatGPT OAuth on a supporting host; `codex` remains legacy. Subscription families use `/login`; API-key families are filled in `auth.json`. |
+| `remove [anthropic\|openai\|codex\|kimi\|cursor\|ollama\|qwen\|<provider-id>]` | **Log out** an account by deleting its credential, including unmanaged providers such as `opencode-go`. Family name drops the highest numbered alias slot; a full provider id removes that exact slot. Does not remove individual models. Aliases: `rm`, `delete`. Use `exclude` to keep the login. |
+| `exclude <provider-id\|provider-id/model-id>` | Persistently omit an exact account or model from rotation without deleting credentials or catalog entries. No argument lists current exclusions. |
+| `include <provider-id\|provider-id/model-id>` | Remove that exact rotation exclusion. Does not log in, clear quota/auth failures, or remove separate model/provider exclusions. |
+| `next` | Manually switch to the next compatible-quality fallback, deliberately overriding recorded cooldowns for one attempt. Use explicit `switch` to select a different tier. |
+| `pin <provider/model>` | Persist a model preference for that provider's account group. A numbered alias applies to its siblings too. Requires an idle live parent; does not select the model. |
+| `unpin <provider-or-family>` | Remove one group's pin without changing its underlying `preferredModels` or catalog order. Idempotent; requires an idle live parent. |
+| `pins [list]` | Read-only sorted list of pins and known catalog/account/cooldown/quality applicability. Never refreshes credentials or probes providers. |
+| `pick` | Open a model picker for the current account only. Uses native model selection and its thinking default; never removes models from the shared registry. Requires an idle interactive session. Built-in `/model` remains unchanged. |
+| `save-default` | Save the current model and effective thinking level together as global startup defaults for new sessions. Preserves other models' thinking preferences. Project overrides, explicit CLI options, and resumed-session settings still take precedence. Automatic rotation never invokes this command; the opt-in `followLastSuccessfulModel` policy separately updates the global model after a successful answer. |
+| `only-active [on\|off]` | Legacy picker preference; use `pick` for a current-account-only menu. The complete Pi model registry remains available to all clients. Alias: `focus`. |
+| `stop` | Abort and cancel automatic failover/resume for the current task. |
+| `reset` | Clear all cooldowns, invalidations and any pending auto-resume. |
+| `reload` | Reload config from disk and re-discover accounts. |
+| `enable` / `disable` | Turn failover on/off for the current Pi process. |
+
+### Exclude without logging out
+
+```text
+/multi-account exclude opencode-go
+/multi-account exclude kimi-coding-account-2
+/multi-account exclude opencode-go/glm-5.1
+/multi-account include opencode-go
+```
+
+Provider exclusion omits all its models on that exact account. Model exclusion affects only the exact `provider/model-id` (model IDs may themselves contain `/`); it does not exclude the same model on other accounts. Use actual IDs, not family nicknames or wildcard patterns. A registered catalog without a stored login is not an authenticated account, so `remove` has nothing to log out, while `exclude` can still keep that catalog-only account out of future rotation.
+
+Exclusions override discovered **and** configured fallback destinations, including `next`, `best`, routed compaction and background completion fallback. They do not interrupt the active model or remove it from `/model`, `pick`, or the shared registry. Explicit `switch` or an explicitly requested initial background route remains allowed; it does not re-enable rotation. These are `pi-multi-account` controls, not a global model ban for other extensions or extension-free children.
+
+The command applies immediately in this session and persists to `provider-failover.json`; other already-running sessions need `/multi-account reload`. New sessions load the saved exclusions. Malformed config or a busy lock reports failure without applying an unsaved exclusion. `include <provider>` leaves separately excluded models intact, and `include <provider/model>` leaves a provider-wide exclusion intact.
+
+### Model pins
+
+```text
+/multi-account pin openai-codex-account-2/gpt-5.4
+/multi-account pins
+/multi-account unpin openai-codex
+```
+
+Pins live in `provider-failover.json` under `pinnedModels`, keyed by account group (for example
+`openai-codex`, `anthropic` or a custom provider's base ID). Other sessions adopt edits on
+`reload` or restart. Extension configuration commands share a locked read-latest transaction;
+unrelated settings and other groups' pins survive concurrent extension writes. A failed/cancelled write does not change the runtime preference.
+
+A pin leads the group's underlying preference/catalog order, but **a healthy exact-model
+sibling still wins**. A pin is not evidence that an older model is a newer flagship. Missing
+models remain saved but inactive until the catalog supplies them; cooling or unauthenticated
+accounts stay ineligible. A cheaper pin cannot demote frontier work. Select the cheaper model
+explicitly with `/model`, `pick` or `switch provider/model` to enter that quality band. A
+provider-only `switch` and automatic compaction cannot use a pin as cheaper-tier consent. Pi-owned
+virtual/image/classifier models cannot be pinned as account chat fallbacks.
+
+## How rotation membership works
+
+- **Joins the rotation** when an account has a present, non-expired credential in `auth.json` (after `/login`).
+- **Leaves the rotation** when the credential is logged out / removed, its access token is expired with no refresh token, an API key is rejected, or a refreshable OAuth credential produces three distinct final auth failures without a success in between.
+- **Explicit exclusion** keeps an account out of rotation until `include`, without losing its login. Per-model exclusions filter destinations without removing the account.
+- **Quota / rate-limit** does not invalidate an account — it records an actual refusal and bounded retry backoff. Expiry permits re-evaluation, not a declaration of recovered availability. A completed, non-error inference clears refusal evidence; HTTP 200 at stream start, OAuth refresh, or a missing completion marker does not. For coupled quota windows, exhausted weekly allowance cannot be hidden by short-window headroom; Cursor's independently selectable pools retain their separate behavior.
+- **Duplicate identities** share one rotation position and one cooldown, and status/startup identifies the redundant slot. Codex/ChatGPT is matched by the JWT's stable `chatgpt_account_user_id` workspace-membership claim; tokens without it use the documented `chatgpt_user_id` plus workspace id, with stored `accountId` as the final legacy fallback. Identical API keys or literal identical tokens are also matched. Separate Anthropic OAuth logins cannot be proven identical because Anthropic's stored credential exposes no stable account identifier.
+
+Rotation refresh is triggered by changes to `auth.json` (detected on session/turn start) or on demand with `/multi-account rediscover`.
+
+After re-authenticating an invalidated slot, restart any older Pi processes that
+were already running. Pi keeps a still-unexpired access token in each process's
+memory, so an old process can continue using the invalidated token even after a
+new `/login` updates `auth.json`.
+
+## Configuration
+
+A default config is created at `~/.pi/agent/provider-failover.json` on first run. Useful keys:
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Master switch. |
+| `autoContinue` | `true` | Immediately continue after a successful account/model switch or same-route temporary retry. This does not control the all-accounts-limited wait. |
+| `resumeAfterAllAccountsRecover` | `true` | When a real quota/rate limit leaves every compatible account cooling, keep the interrupted task armed in the current live session and resume on the first account that becomes genuinely usable. Independent of `autoContinue`; set `false` to opt out. |
+| `autoDiscover` | `true` | Auto-discover accounts from `auth.json`. |
+| `excludedProviders` | `[]` | Exact provider/account IDs excluded from discovered and configured rotation, e.g. `["opencode-go", "kimi-coding-account-2"]`. Credentials and catalog entries are preserved. |
+| `excludedModels` | `[]` | Exact `provider/model-id` destinations excluded from rotation, e.g. `["opencode-go/glm-5.1"]`. No wildcard or family matching; manual model selection remains available. |
+| `autoDiscoverModels` | `true` | Fetch OpenAI's authenticated model catalog for every Codex account and register new models on that account's alias automatically. |
+| `includeQwen` | `true` | Include Qwen / Alibaba accounts. |
+| `includeOllama` | `true` | Include Ollama (local) accounts. |
+| `neverFailoverProviders` | `[]` | Provider ids to never automatically fail away from, e.g. `["my-provider"]`. Foreground startup/input preflights, pending retries, and compaction leave these routes to Pi even with stale cooldowns. Manual switches remain allowed. For **unmanaged** providers that run their own retry logic (typically a companion extension owning retries for that provider) — switching accounts underneath it would fight those retries. Managed accounts still cool and rotate normally. |
+| `includeCursor` | `true` | Include Cursor subscription accounts. The Cursor provider is a separate, optional repo — until it is cloned this setting does nothing at all: no cursor login slot is offered and no warning is printed. Run `/multi-account add cursor` to get the install instructions. |
+| `followLastSuccessfulModel` | `false` | Opt-in terminal-Pi policy: after a successful foreground answer, save its actual provider/model as the global startup default (without changing thinking). A fresh session follows the latest successful model across project directories; resumed/explicit CLI sessions retain their own selection. If Pi resolves a missing saved model to direct `openai/gpt-5.5`, try a ready managed account instead; otherwise block interactive input with a warning rather than silently spend direct API credits. Other SDK/print/child sessions are unaffected. Project settings overrides may still win during Pi's initial resolution. |
+| `childProxy` | `true` | Serve OAuth rotation slots to processes that do not load this extension (a memory extension consolidating its notes, an external CLI, any `pi -p --no-extensions` call) through a loopback route this process owns. A bare child launched without `--model` inherits Pi's **saved global default**, which since Pi 0.84.3 intentionally may differ from this session's live rotation; an explicitly pinned child uses its requested slot. Without a usable publication either form can fail authentication and fall back to whichever provider Pi finds first. The published route carries a non-secret placeholder; the real credential never leaves the parent. |
+| `providerOrder` | `["anthropic","openai-codex","qwen","ollama"]` | Preferred family order in the rotation. |
+| `cooldownMs` | 6 h | Default cooldown when no reset metadata is provided. |
+| `showUsage` | `true` | Show active Codex/Claude/xAI limits in Pi's footer. |
+| `usageRefreshMs` | 5 min | Per-account usage cache TTL; every authenticated rotation account is refreshed independently, and Anthropic is clamped to at least 10 min to avoid endpoint throttling. |
+| `usageStatusRefreshMs` | 1 min | Re-render the footer and sweep idle sessions for stale usage/model catalogs; network refreshes remain limited by their five-minute (Anthropic: ten-minute) TTLs. |
+| `maxAutoContinuesPerPrompt` | `8` | Cap on auto-resume hops per task. |
+| `continuationPrompt` | (built-in) | Template; supports `{from}`, `{to}`, `{reason}`. |
+| `maxRecheckIntervalMs` | `600000` (10 min) | Ceiling on how long a quota snapshot may bench an account before background refresh/re-evaluation. A fresh explicit provider verdict (`serviceable: false`) is authoritative during that interval and is skipped by automatic routing; manual `next` can still spend one deliberate probe. |
+| `preserveInterruptedContext` | `true` | When interrupted context is available, offer the next request a bounded `[handoff:interrupted-turn]` projection. It is optional request context, not a guaranteed durable verbatim transcript or a receipt. A missing tool result means unknown effects, not proven nondispatch; consult actual calls/results before any replay. Deterministic (never moves the prompt-cache breakpoint) and hard-capped. Set to `false` to omit it. |
+| `continueAfterCompaction` | `true` | After an **automatic** compaction, carry the task on instead of ending the run and waiting for the user to type "continue". This covers both Pi's threshold/overflow path (a follow-up is queued while compaction is still in flight so Pi's own `hasQueuedMessages()` route drains it) and the extension's context-guard summary (a real turn starts only from Pi's completion callback, because that guard compacts from an already-idle boundary). One continuation shares the `maxAutoContinuesPerPrompt` budget with failover and is skipped for a manual `/compact`, when Pi is already retrying, when another message/turn is present, and after the user pressed Esc. The message tells the model that finishing is valid. Set `false` only when another installed extension owns post-compaction continuation. |
+| `providerPriority` | managed families, per-token providers last | Where work goes once **every** account of the current provider is spent. An ordered list of provider groups — a managed family, or the base id of anything else you are logged in to (`openrouter`, `zai`, `minimax`…), which `providerOrder` could never name. Three bounds: same-provider failover always runs first and is untouched (588 of 602 automatic failovers in a real black box stayed inside the family — that step already worked); an account on a real cooldown is never chosen over a free one; and a group nobody ranked sorts after every group somebody did. Inside those bounds it settles the hop that used to be arbitrary — the other 14 of those 602 scattered across five destinations with no policy behind them. It sits below the per-account liveness signals on purpose: evidence about one account beats a preference about its category. Set with `/multi-account priority ...`. |
+| `contextGuard` | `true` | Keep every request inside the model's context window **while the agent is working**. Pi ≥0.84.4 also compacts between tool execution and the next assistant request. This optional guard adds a local window cap (especially for advertised 1M windows). Existing elisions are reapplied before measuring the outgoing request; another batch is added only when it crosses the soft threshold again, rather than invalidating the cached prefix on each tool turn. Above 75 % of the usable window the oldest large tool results are left out of the outgoing request (the transcript is never touched); above 70 % a real summary is requested at the next settled boundary. The size is measured locally rather than taken from the provider, because Cursor and openai-codex both report the size of their own server-side copy of the conversation. Pass an object to override `softPercent`, `targetPercent`, `compactPercent`, `keepVerbatimTokens`, `minElideTokens`, `maxWindowTokens` (default `400000`: a ceiling on advertised windows, since a model claiming 1 000 000 puts Pi's own threshold out of reach entirely). `false` disables it. |
+| `routeCompactionToHealthyAccount` | `true` | When the active account is rate-limited/invalid and Pi needs to compact, generate the summary on a healthy fallback account. If every live attempt fails, cancel — never hand the job to Pi's default on the spent account (that is the infinite "Compacting context…" spinner). |
+| `compactionWatchdogMs` | 8 min | Upper bound for one routed compaction attempt. A timed-out attempt is aborted and the next live account is tried. |
+| `resumeIdleTimeoutMs` | 90 s | Max time to wait for the previous turn to go idle before a resume gives up and retries later (never an unbounded loop). |
+| `stuckWatchdogMs` | 180 s | A resumed turn silent for this long (with no tool running) is treated as wedged. |
+| `autoRecoverStuck` | `true` | When a resume wedges, auto-cancel it and retry the same provider/model within the shared recovery budget, instead of only notifying. Set `false` for notify-only. |
+| `debugLog` | `true` | Write a structured "black box" decision log to `provider-failover-debug.log` (no credentials — only provider/model ids and truncated reasons). View with `/multi-account log`. |
+| `preferLatestModel` | `true` | Rank the strongest/current model ahead of older siblings within the current quality band during automatic failover. |
+| `reasoningLevel` | `"auto"` | `"auto"` follows the level the session actually runs at (your Pi default, `/thinking`, per-agent `--thinking`) and only restores it after switches. Set an explicit level (`"off"`…`"xhigh"`) to **force** it on every turn regardless of the session — `"xhigh"` only if you really want the extreme level. |
+| `preferredModels` | `{}` | Optional manual strongest-first override per family; when present it wins over live catalog priority. A model pin leads this order without rewriting it. |
+| `pinnedModels` | `{}` | One explicit model ID per account group, managed by `pin` / `unpin`. Inactive when unavailable/incompatible; never grants account health or a different automatic quality band. |
+
+State (cooldowns, actual-refusal timestamps/retry bounds/provider reset estimates, invalidations, recent switches, credential-free Codex model catalogs, and a diagnostic pending marker) is persisted to `~/.pi/agent/provider-failover-state.json`. The actual pending task is session-local: one Pi window never consumes or resumes another window's work. Pending work is discarded when its owning session closes.
+
+### Session model ownership
+
+Requires the supported Agent Pi versions listed above. By default Pi's session branch and explicit SDK/CLI launch model are authoritative. Shared account telemetry and legacy `lastUserModel` / `lastUserThinkingLevel` state cannot replace another pane's live selection, and shutdown does not publish that selection as a global default. Cold-catalog repair now waits up to 1.5 seconds for Cursor's discovered model ids before Pi's one-shot restore; a slow/offline catalog still falls back to its static list. Configure Pi's saved default explicitly for new sessions, or opt in to `followLastSuccessfulModel` to update it after each successful terminal answer. That policy applies only to fresh interactive sessions; it never replaces the model of a resumed session.
+
+### Cursor context and transport ownership
+
+Cursor resumes only a checkpoint covering the exact canonical transcript and explicit request workspace. Equal-length foreign-provider progress, history replacement or changed system context rebuild from Pi rather than silently using stale server context. Conversation/request generations fence late checkpoint/error/blob callbacks; identity-less public completions use isolated state instead of sharing a prompt-prefix cache. Caller `cwd` is forwarded as local `pi_cwd`; unknown workspace is not invented from the proxy process's cwd.
+
+The complete rebuilt transcript remains in the root context blob. A small latest canonical Pi compaction checkpoint (at most 32KB) is also repeated verbatim in the inline action, with the latest owner request kept last and combined action capped at 48KB. Larger context remains complete in the root blob, not truncated or replaced; large actions are not enlarged. This avoids depending only on local blob presence for typical post-compaction task delivery without reviving the known large-inline-action tool stall. It is not a guarantee that every upstream model follows any supplied context.
+
+SSE and JSON responses share tool pause/resume, ownership, useful-output/transport watchdogs, cancellation and cleanup. Only protocol `turnEnded` is normal completion; early EOF (even exit 0) is a transport error. The native OpenAI-compatible consumer receives a standard SSE error envelope, preserving auth/quota/transient evidence rather than only `Provider finish_reason: error`. HTTP/protocol status metadata crosses a bounded stderr side channel; protobuf stdout bytes are unchanged and no raw headers/body/auth are forwarded there. Spawn failure settles once; normal process close drains final stdout before settlement. Native tool results preserve explicit Pi error bits (including normalized pipe ids), shell cwd scopes the whole script, and write results describe the requested file content rather than the tool's acknowledgment prose.
+
+### Host-owned background completions
+
+When the host exposes `registerCompletionRouter`, Multi Account registers one credentialless completion router with it. This is capability-detected, not inferred from the Pi version: stock Pi 0.85.1 does not expose this optional API, so the integration remains inactive there. Extensions can request isolated background completions through Pi without importing or calling Multi Account. The router sees operation IDs, model identities, attempt outcomes, and provider response facts only; prompts and credentials remain inside the host.
+
+Background attempts share the same cooldown and invalidation state as foreground routing. Quota, authentication, model, and transport failures can select a healthy fallback; parser and consumer failures do not affect route health. The route lease is operation-local: it never calls `pi.setModel`, queues a continuation, or changes the user's selected foreground model.
+
+### pi-subagents and delegation-broker compatibility
+
+`pi-subagents` marks native child processes with `PI_SUBAGENT_CHILD=1` and owns their explicit model plus `fallbackModels` chain. Under terminal Pi, a distinct concurrent in-process child also stays passive while a root activation is live. A replacement with the **same nonempty session ID** reacquires that root's failover ownership without closing its child proxy. The root lease is released at final session shutdown, so `/reload` and `/new` do not permanently lose routing ownership. In passive children this extension stays loaded only for provider/account registration, OAuth request shaping, and catalog support. It deliberately does **not** restore the interactive process's remembered model, persist the child's model as a user preference, switch models, queue work, or auto-continue after errors. The original provider error is returned unchanged so the parent runner can advance its verified fallback chain without a second router competing for model identity.
+
+### Multi-session hosts (pi-web and other in-process SDK hosts)
+
+Some hosts run many independent sessions in a single long-lived process — pi-web's session daemon, or in-process SDK hosts such as Enso (one session per chat thread). Terminal Pi's in-process root-activation lease would incorrectly demote every session but the first to passive in those hosts.
+
+- Under pi-web (`PI_WEB_SESSION=1`, set by the daemon itself) every session activates as an independent root automatically.
+- Any other multi-session host opts in by exporting `PI_MULTI_ACCOUNT_INDEPENDENT_ROOTS=1` in the host process. Set this only when each session truly owns its model; sessions that share one model identity must keep the default single-root behavior.
+- Genuine `pi-subagents` children are unaffected either way: they run in a runner process marked `PI_SUBAGENT_CHILD=1`, which always takes precedence and stays passive.
+
+Hosts should not set `PI_WEB_SESSION` themselves — other extensions read it to detect pi-web specifically.
+
+In one process, independent roots share one canonical loopback proxy and its child-facing auth/models publication while any root has the child proxy enabled. Closing one root cannot expose its sibling's real OAuth or remove the route its bare children use; the final live root closes the listener and restores the original auth. A rehydrated session with the same ID replaces the old instance's failover ownership rather than counting as a second root. Another process holding the canonical port remains the publisher; a foreign listener is never allowed to overwrite its shared files.
+
+Roots with `childProxy: false` still participate in the shared lifetime if another root publishes placeholders. Any public numbered alias they registered earlier is moved to loopback **before** the placeholder appears; they keep the canonical listener alive if the publisher exits first, and only the final root restores auth. With no other publishing root, disabling `childProxy` retains the usual direct route. Hosts should still keep one consistent setting across concurrent roots.
+
+[`pi-delegation-broker`](https://github.com/Sarrius/pi-delegation-broker) is an optional companion for splitting work among isolated child agents, with task budgets, reports and verification. Each extension works independently and depends on Agent Pi, not on the other extension. Together, Multi Account manages your interactive account rotation while the broker delegates through Pi's registered providers and models. Neither installs or initializes the other.
+
+## Staying unstuck (resilience)
+
+A failover is only useful if the agent actually keeps working afterward. These guarantees keep a switch from silently freezing the session:
+
+- **Model compatibility is distinct from quota.** An explicit unsupported-model refusal excludes only the attempted account/model, not its credentials or every account offering that model. Routed summaries remember the same refusal. Native summary recovery uses the host's optional captured `session_compact_failed.requestModel` identity; a host without reliable request provenance pauses rather than blaming its possibly changed selection. Failed/unconfirmed summary wakes never claim a successful checkpoint.
+- **Native compaction requires a bounded host.** The repaired Pi host exposes `compaction.timeoutMs` (30 minutes by default) across auth, extension preparation and native generation/retries. This preserves known 12–17 minute successes while settling unresponsive operations and rejecting late checkpoints. Cancellation requests local settlement; it is not proof of remote termination. Older hosts lack this deadline. After a core repair, fully exit/restart and resume Pi: `/reload` alone does not replace imported core modules. The shared automatic-continuation budget still applies and its exhaustion is explicitly reported as paused, not working.
+- **Compaction survives account limits — and never leaves the spinner running.** When your context fills up and the active account is rate-limited, the summary is generated on a *healthy* account. If that attempt times out it is aborted (not leaked) and the next live account is tried. If none can finish, compaction is cancelled so "Compacting context…" stops; Pi's default is never given a spent account.
+- **Temporary verification recovery is distinct from policy denial.** Native Pi summaries use its configured bounded retry policy for the specific `Unable to verify Daybreak [Blue] access` outage; routed summaries retry the same captured model/auth/input at most twice (2s/4s backoff, inside the existing abort/watchdog budget). A successful retry retains normal compaction/continuation. A genuine cybersecurity content-policy denial never retries or hops accounts. If verification cannot recover inside the budget, preserve history, clear guard in-flight state and explicitly settle automatic continuation until new input/manual control; do not spin forever. Neither failure proves expired login or permanently missing entitlement. Native retry classification and the empty-history split-summary fix require a host build containing the corresponding Pi repairs, not just this extension.
+- **Resumes only happen when there is something to resume.** The extension continues a turn only when it actually ended in an error it can pick up from — it never tries to "continue" a finished reply (the cause of the cryptic `Cannot continue from message role: assistant` error).
+- **A forward-progress watchdog that acts.** If a resumed turn goes completely silent (no streaming, no tool activity, no provider response) and no tool is running, the extension auto-cancels the wedged turn and retries the same provider/model within the recovery budget — you do not have to press Esc or re-type the prompt. A long, silent build/test command is never mistaken for a wedge.
+- **A circuit breaker as the floor.** If automatic recovery keeps failing, the extension drops to *advisory mode*: confirmed quota limits can still select a fresh account, but temporary errors preserve the selected route and stop the auto-continue that was failing, so a bad state can never spiral into repeated hangs. It re-enables itself on the next success, a new prompt, or `/multi-account reset`.
+- **A black box for diagnosis.** Every decision (switch, error and how it was classified, watchdog action, breaker trip, compaction routing) is appended to `~/.pi/agent/provider-failover-debug.log`. If anything misbehaves, run `/multi-account log` — the exact sequence is there, so a bug can be reproduced and fixed instead of guessed at. The file is bounded in size and redacts token-shaped material; review private project details before sharing it.
+
+## Privacy & security
+
+`pi-multi-account` reads credentials through Pi and its account store. Account removal, OAuth refresh and parent-owned proxy publication can update the credential files under Pi-compatible locks. Proxy publication keeps a private recovery copy before replacing a credential with a loopback placeholder, and restores the real credential before deleting that copy. Credentials are never stored in rotation state. Account/token values are reduced to a short irreversible SHA-256 fingerprint for re-login detection and deduplication. Credentials are sent only to their own provider endpoints: usage/account probes (`chatgpt.com/backend-api/wham/usage`, `api.anthropic.com/api/oauth/usage`, `cli-chat-proxy.grok.com/v1/billing`, `open.bigmodel.cn/api/monitor/usage/quota/limit` (CN Coding Plan keys only), Ollama Cloud's `/api/me` and `/api/usage`, or Ollama's loopback-only `http://127.0.0.1:11434/api/me` fallback), OpenAI's authenticated `chatgpt.com/backend-api/codex/models` catalog, and provider OAuth token endpoints when Pi's authentication implementation refreshes a login (for xAI, `auth.x.ai/oauth2/token`; for native ChatGPT, `auth.openai.com/api/accounts/oauth/token`). Native new ChatGPT requests use `api.openai.com/v1/responses`, with no legacy Codex usage/catalog probes. Cached state contains percentages, reset times, plan/credit metadata, model metadata, provider-reported account email/alias, and the fingerprint, never the token. Config, state, and the debug log are written with `0600` permissions. The debug log records only provider/model ids, decisions, and truncated reasons — token-shaped material is redacted defensively — Review logs for private project details before sharing an issue. Disable it with `"debugLog": false` or `/multi-account log off`.
+
+For Cursor transport diagnosis, prefer `PI_CURSOR_PROVIDER_DEBUG=1` together with `PI_CURSOR_PROVIDER_DEBUG_METADATA_ONLY=1` (optionally `PI_CURSOR_PROVIDER_DEBUG_FILE=/private/path/log.jsonl`). This records protocol cases, counts, timing and hashed correlation IDs, not prompts, tool results or headers. New log files are created with `0600` permissions; existing files keep their permissions. Full transport debugging without metadata-only mode may contain task content and is not safe to share unreviewed.
+
+### Forced-refresh transaction boundary
+
+Extension-owned forced refresh for Anthropic, native OpenAI ChatGPT, legacy Codex, Cursor and xAI requires successful read-only admission through the host's `AuthStorage.modify` API, then uses the same Pi-compatible auth-file lock with an explicit fast heartbeat. It reads the authoritative credential after acquisition and adopts a newer login without another exchange. Both auth and parent-only sidecar outputs are staged until refresh work actually joins, then fenced against cancellation, replaced/compromised lock identity and changed disk state before commit. Cursor propagates this signal through fetch and response-body consumption. A cancelled uncooperative callback retains its lease until it settles. Contenders wait within cancellation/deadline bounds; stale empty leases can recover. The async lease uses the native directory/mtime protocol without a library-global exit-unlink registry, so an immediately exiting stale holder cannot delete its replacement; a crashed owner leaves a bounded stale lease instead. Numbered slots keep their child-facing placeholders. Missing transactional API or failed admission means no token rotation; failures never fall through to `set()` or a blind stale write. A host's supplied first-class forced-refresh operation and normal host-owned OAuth retain their own responsibility. This is not a guarantee about remote token revocation, arbitrary hostile filesystem writers or unrelated native host refresh transactions.
+
+### Dependency advisory check
+
+From a source checkout, `npm run security:check` is an offline, read-only gate for `GHSA-q2hr-2g5m-vwhr` / Dependabot #13. It checks both locked and actual installed `brace-expansion` versions; affected, missing/unknown or mismatched evidence fails. Use a clean `npm ci --ignore-scripts` tree. The matched Pi **1.1.0 development SDK pair** resolves the patched **5.0.12**, without the older SDK's vulnerable nested shrinkwrap. This does not upgrade the globally installed Pi or remove older hosts from compatibility tests. GitHub alert state is checked separately; no override-only claim, runtime patch or advisory dismissal substitutes for installed evidence.
+
+## Compatibility validation
+
+`npm run release:check` runs TypeScript, the full suite, and package/privacy checks. CI also runs
+the suite on the supported newer Pi versions. Host-binding tests load the real extension wrapper
+through Pi with a deliberately incompatible nested pi-ai, inspect native request bodies, and
+complete a streamed tool-call/result cycle without real credentials or provider traffic.
+A real `pi --no-extensions` subprocess also exercises a numbered Anthropic OAuth slot and native
+`read` tool roundtrip against a fake upstream. Its non-secret OAuth-shaped placeholder preserves
+native identity and tool mapping; real credentials remain in the parent. Legacy publications
+migrate only with an intact parent-side recovery copy. Production refresh persists into the
+private sidecar under the auth lock without briefly replacing the child's placeholder. API-key
+aliases remain direct native publications; stale loopback metadata accepts only the current key.
+Cancellation aborts the proxy's upstream request; ordinary API-key request semantics remain unchanged. These are deterministic regressions,
+not a claim of live Anthropic or Codex-image acceptance. Native ChatGPT tests also exercise the actual authorization/device/client/scopes contract, prompt cancellation and a separate extension-free Responses image/tool/replay/cancel/teardown roundtrip. They block external provider traffic and do not claim live new-grant login, quota or availability.
+
+Offline fixtures establish mechanism behavior, not current live-provider availability. A source edit is not code adoption: verify the loaded version/fingerprint in a fresh Pi process. Changes to imported broker `.mjs` modules can require a full exit/restart rather than only `/reload`. Continuations name the actual failure reason; only an exact shipped legacy default is migrated in memory, never a custom continuation template.
+
+The optional companion Goal integration is selected explicitly; it never assumes a personal path:
+
+```bash
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts node --test test/goal-quota-recovery.integration.test.ts
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts PI_GOAL_EXHAUST_ALL=1 node --test test/goal-quota-recovery.integration.test.ts
+PI_GOAL_TEST_ENTRY=/path/to/pi-goal/dist/index.ts PI_GOAL_EXHAUST_ALL=1 PI_GOAL_RECOVER_ALL=1 node --test test/goal-quota-recovery.integration.test.ts
+```
+
+These exercise successful multi-hop continuation, quiet all-account waiting with explicit pause,
+and resumption after quota recovery. The test is explicitly skipped when no companion path is supplied.
+
+## License
+
+[MIT](./LICENSE)
+
+
+### Help make these tools more reliable
+
+Use them on real work? Share a reproducible [issue](https://github.com/Sarrius/pi-multi-account/issues), a small regression test, a documentation improvement, or a focused PR. Include Pi/extension versions and expected versus actual behavior; remove credentials and private task data. Shared fixes cover more providers and workflows than one maintainer can test alone.

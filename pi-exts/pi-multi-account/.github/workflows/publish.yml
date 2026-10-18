@@ -1,0 +1,72 @@
+name: Publish npm package
+
+on:
+  # A pushed release tag publishes on its own: the repo used to require someone to
+  # remember to press "Run workflow", and four releases' worth of fixes sat unpublished
+  # on main for a week because nobody did. The environment still requires an approval,
+  # so nothing reaches npm unattended.
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: npm dist-tag
+        required: true
+        default: latest
+        type: string
+      dry_run:
+        description: Validate publishing without uploading
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run release:check
+      - name: Require the checked-out version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          test "${GITHUB_REF_TYPE}" = "tag"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          # A tag that re-publishes an existing version can only fail at the registry;
+          # say so here instead, where the reason is readable.
+          if npm view "pi-multi-account@${version}" version >/dev/null 2>&1; then
+            echo "pi-multi-account@${version} is already published — bump the version first" >&2
+            exit 1
+          fi
+      - name: Publish through npm trusted publishing
+        shell: bash
+        env:
+          # A tag push carries no inputs: publish for real, under the default dist-tag.
+          DIST_TAG: ${{ inputs.dist_tag || 'latest' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            npm publish --dry-run --access public --tag "${DIST_TAG}"
+          else
+            npm publish --provenance --access public --tag "${DIST_TAG}"
+          fi
