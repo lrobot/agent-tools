@@ -1,6 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { fetch as oauthFetch } from "undici";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+// Read proxy config from proxy-router.json for OAuth refresh
+function getProxyUrlForAuth(provider: string): string | null {
+  try {
+    const configPath = join(homedir(), ".pi", "agent", "proxy-router.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    return config?.auth?.[provider] ?? null;
+  } catch {
+    return null;
+  }
+}
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
 import { escapeHtml, antigravityEnv } from "../utils/util.js";
@@ -398,16 +412,41 @@ export async function refreshAntigravityToken(
 ): Promise<AntigravityOAuthCredentials> {
   // SDK hosts may use Node 26 built-in fetch with a separate Undici dispatcher.
   // Use Undici's fetch to keep response decompression on the same implementation.
-  const response = await oauthFetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      refresh_token: credentials.refresh,
-      grant_type: "refresh_token",
-    }).toString(),
-  });
+  const proxyUrl = getProxyUrlForAuth("antigravity");
+  
+  const postData = new URLSearchParams({
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    refresh_token: credentials.refresh,
+    grant_type: "refresh_token",
+  }).toString();
+  
+  let response: { ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<any> };
+  try {
+    // Set proxy env temporarily for this OAuth refresh request
+    const oldHttpProxy = process.env.HTTP_PROXY;
+    const oldHttpsProxy = process.env.HTTPS_PROXY;
+    if (proxyUrl) {
+      process.env.HTTP_PROXY = proxyUrl;
+      process.env.HTTPS_PROXY = proxyUrl;
+    }
+    
+    try {
+      response = await oauthFetch(TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: postData,
+      });
+    } finally {
+      // Restore env
+      if (oldHttpProxy !== undefined) process.env.HTTP_PROXY = oldHttpProxy;
+      else delete process.env.HTTP_PROXY;
+      if (oldHttpsProxy !== undefined) process.env.HTTPS_PROXY = oldHttpsProxy;
+      else delete process.env.HTTPS_PROXY;
+    }
+  } catch (err) {
+    throw err;
+  }
   if (!response.ok) {
     throw new Error(
       `Antigravity token refresh failed: ${sanitizeOAuthProviderError(await response.text())}`,

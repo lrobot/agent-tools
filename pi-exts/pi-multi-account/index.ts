@@ -325,6 +325,12 @@ import {
 	type UsageWindow,
 	type UsageWindowPosition,
 } from "./usage.ts";
+import {
+	findCustomFamily,
+	getAllCustomFamilies,
+	registerCustomFamily,
+	type CustomFamilyDescriptor,
+} from "./custom-family-registry.ts";
 
 type ModelRef = `${string}/${string}`;
 type ProviderFamily =
@@ -334,7 +340,8 @@ type ProviderFamily =
 	| "kimi-coding"
 	| "qwen"
 	| "ollama"
-	| "cursor";
+	| "cursor"
+	| (string & {});
 type ReasoningLevel =
 	| "off"
 	| "minimal"
@@ -2554,6 +2561,8 @@ function classifyProvider(
 	if (isCursorProviderId(id)) return "cursor";
 	if (id === "kimi-coding" || /^kimi-coding-account-\d+$/.test(id))
 		return "kimi-coding";
+	const custom = findCustomFamily(id);
+	if (custom) return custom.family;
 	return undefined;
 }
 
@@ -2675,6 +2684,13 @@ function apexIdentity(modelId: string | undefined): "astra" | "fable" | undefine
  */
 export function modelQualityBand(modelId: string | undefined, provider?: string): ModelQualityBand | undefined {
 	if (!modelId) return undefined;
+	if (provider) {
+		const custom = findCustomFamily(provider);
+		if (custom?.qualityBand) {
+			const band = custom.qualityBand(modelId);
+			if (band) return band;
+		}
+	}
 	const exceptional = apexIdentity(modelId);
 	const baseProvider = baseProviderId(provider);
 	if (exceptional) {
@@ -6238,7 +6254,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 	}
 
 	function discoverRotation(auth: Record<string, AuthEntry>): string[] {
-		const byFamily: Record<ProviderFamily, string[]> = {
+		const byFamily: Record<string, string[]> = {
 			anthropic: [],
 			"openai-codex": [],
 			openai: [],
@@ -6247,6 +6263,9 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			qwen: [],
 			ollama: [],
 		};
+		for (const custom of getAllCustomFamilies()) {
+			byFamily[custom.family] ??= [];
+		}
 		for (const [id, entry] of Object.entries(auth)) {
 			if (config.excludedProviders.includes(id)) continue;
 			const family = classifyProvider(id, config.qwenProvider);
@@ -6257,16 +6276,22 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			if (family === "openai" && (!nativeOpenAI || !isOpenAIChatGPTCredential(entry))) continue;
 			if (!isEntryUsable(entry)) continue;
 			if (isInvalidated(id)) continue;
+			byFamily[family] ??= [];
 			byFamily[family].push(id);
 		}
 		// Sort each family base-first, then account-2,3,... and dedupe real accounts.
-		const order = config.providerOrder.length
-			? config.providerOrder
-			: DEFAULT_PROVIDER_ORDER;
+		const order: string[] = config.providerOrder.length
+			? [...config.providerOrder]
+			: [...DEFAULT_PROVIDER_ORDER];
+		for (const custom of getAllCustomFamilies()) {
+			if (!order.includes(custom.family)) {
+				order.push(custom.family);
+			}
+		}
 		const seenIdentity = new Set<string>();
 		const result: string[] = [];
 		for (const family of order) {
-			const ids = byFamily[family].sort((a, b) => slotIndex(a) - slotIndex(b));
+			const ids = (byFamily[family] ?? []).sort((a, b) => slotIndex(a) - slotIndex(b));
 			for (const id of ids) {
 				const identity = accountIdentity(auth[id], id);
 				if (identity && seenIdentity.has(identity)) continue; // same account in two slots
@@ -6543,7 +6568,7 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 						});
 					}
 				} else if (family === "ollama" || family === "qwen") {
-					registerApiKeySlot(pi, id, family, config.qwenProvider, ctx);
+					registerApiKeySlot(pi, id, family as "ollama" | "qwen", config.qwenProvider, ctx);
 				}
 				registeredSlots.add(id);
 			}
@@ -10410,6 +10435,15 @@ export default function piMultiAccount(pi: ExtensionAPI) {
 			handler: safeHandleCommand,
 		});
 	}
+
+	// ----- Dynamic custom family extension handshake -----------------------
+	(pi as any).events?.on?.("pi-multi-account:register-family", (descriptor: CustomFamilyDescriptor) => {
+		if (descriptor && descriptor.family) {
+			registerCustomFamily(descriptor);
+			rotation = discoverRotation(readAuthFile());
+		}
+	});
+	(pi as any).events?.emit?.("pi-multi-account:ready", { version: "1.25.0" });
 
 	// ----- Anthropic OAuth out of the box -----------------------------------
 	// Enable Claude Pro/Max OAuth login on the base `anthropic` provider and shape

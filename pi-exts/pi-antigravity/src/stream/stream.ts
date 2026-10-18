@@ -323,7 +323,11 @@ export function convertMessages(
         continue;
       }
       const parts: GeminiPart[] = [];
-      const isSameModel = msg.provider === PROVIDER_ID && msg.model === model.id;
+      const isSameModel =
+        (msg.provider === model.provider ||
+          ((msg.provider === PROVIDER_ID || msg.provider?.startsWith("antigravity-account-")) &&
+            (model.provider === PROVIDER_ID || model.provider?.startsWith("antigravity-account-")))) &&
+        msg.model === model.id;
       const toolCalls = msg.content.filter((b): b is ToolCall => b.type === "toolCall");
       const firstCallHasSig =
         toolCalls.length > 0 && isValidThoughtSignature(toolCalls[0]?.thoughtSignature);
@@ -1124,7 +1128,7 @@ function createOutput(model: Model<Api>): AssistantMessage {
     role: "assistant",
     content: [],
     api: ANTIGRAVITY_API,
-    provider: PROVIDER_ID,
+    provider: model.provider || PROVIDER_ID,
     model: model.id,
     usage: {
       input: 0,
@@ -1523,7 +1527,8 @@ export function streamAntigravity(
     const startTime = Date.now();
     const output = createOutput(model);
     try {
-      let creds = parseApiKey(opts.apiKey);
+      const resolvedApiKey = await Promise.resolve(opts.apiKey);
+      let creds = parseApiKey(resolvedApiKey);
       const triedAccessTokens = new Set<string>([creds.token]);
       const primaryEndpoint = endpointCandidates()[0];
       if (primaryEndpoint) prewarmConnection(primaryEndpoint);

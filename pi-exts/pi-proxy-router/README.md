@@ -95,6 +95,7 @@ For migration, legacy global/project `settings.json` entries under `proxy-router
 - `kimi-coding`: `auth.kimi.com/api/oauth/device_authorization`, `auth.kimi.com/api/oauth/token`
 - `openrouter`: `openrouter.ai/api/v1/auth/keys`
 - `xai`: `auth.x.ai/oauth2/device/code`, `auth.x.ai/oauth2/token`
+- `antigravity`: `oauth2.googleapis.com/token` (token exchange and refresh), `www.googleapis.com/oauth2/v1/userinfo` (login userinfo)
 
 Token exchange, refresh, and device-code requests from an in-session `/login` flow use the provider rule. Browser authorization pages are outside the extension, and the standalone `pi auth ...` command does not load extensions; use `HTTP_PROXY` / `HTTPS_PROXY` for that process.
 

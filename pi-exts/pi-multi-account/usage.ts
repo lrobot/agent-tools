@@ -2,7 +2,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding" | "xai" | "zai-coding-cn";
+import { findCustomFamily } from "./custom-family-registry.ts";
+
+export type UsageFamily = "codex" | "anthropic" | "ollama" | "cursor" | "qwen" | "kimi-coding" | "xai" | "zai-coding-cn" | (string & {});
 
 export type UsageWindow = {
 	usedPercent: number;
@@ -114,6 +116,8 @@ export function usageFamily(provider: string): UsageFamily | undefined {
 	if (provider === "kimi-coding" || /^kimi-coding-account-\d+$/.test(provider)) return "kimi-coding";
 	if (provider === "xai" || /^xai-account-\d+$/.test(provider)) return "xai";
 	if (provider === "zai-coding-cn" || /^zai-coding-cn-account-\d+$/.test(provider)) return "zai-coding-cn";
+	const custom = findCustomFamily(provider);
+	if (custom) return custom.family;
 	return undefined;
 }
 
@@ -867,6 +871,11 @@ export async function fetchUsageSnapshot(
 	const family = usageFamily(provider);
 	if (!family) throw new UsageFetchError(`Usage is not supported for ${provider}`);
 
+	const custom = findCustomFamily(provider);
+	if (custom?.fetchUsageSnapshot) {
+		return custom.fetchUsageSnapshot(provider, credential, options);
+	}
+
 	if (family === "ollama") {
 		return fetchOllamaUsageSnapshot(provider, credential, options);
 	}
@@ -954,6 +963,8 @@ export function providerUsageLabel(provider: string): string {
 	if (provider.startsWith("xai")) return index ? `xAI A${index}` : "xAI";
 	if (provider.startsWith("zai-coding-cn")) return index ? `GLM CN A${index}` : "GLM CN";
 	if (provider.startsWith("alibaba") || /^qwen/i.test(provider)) return index ? `Qwen A${index}` : "Qwen/Alibaba";
+	const custom = findCustomFamily(provider);
+	if (custom) return index ? `${custom.label} A${index}` : custom.label;
 	return provider;
 }
 

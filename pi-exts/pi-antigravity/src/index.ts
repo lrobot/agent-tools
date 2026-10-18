@@ -11,11 +11,14 @@ import * as piAiCompat from "@earendil-works/pi-ai/compat";
 import {
   activateAccount,
   getApiKey,
+  getApiKeyForSlot,
   listAccounts,
   loginAntigravity,
   rememberAccount,
   refreshAntigravityToken,
   removeAccount,
+  sortedStoredAccounts,
+  syncAllCredentials,
   updateRememberedAccount,
 } from "./auth/index.js";
 import { DEFAULT_ENDPOINT } from "./client/index.js";
@@ -178,11 +181,75 @@ export default function (pi: ExtensionAPI): void {
     },
   };
 
-  // Pi 0.86 types are chat-only; newer Pi accepts mixed-operation models and images.
-  pi.registerProvider(
-    PROVIDER_ID,
-    providerConfig as unknown as Parameters<typeof pi.registerProvider>[1],
-  );
+  syncAllCredentials();
+  const storedAccounts = sortedStoredAccounts();
+  const slotCount = Math.max(1, storedAccounts.length);
+
+  for (let i = 1; i <= slotCount; i++) {
+    const slotId = i === 1 ? PROVIDER_ID : `antigravity-account-${i}`;
+    const slotName = i === 1 ? PROVIDER_NAME : `${PROVIDER_NAME} (${slotId})`;
+    const currentSlotConfig = {
+      ...providerConfig,
+      name: slotName,
+      oauth: {
+        ...providerConfig.oauth,
+        name: slotName,
+      },
+    };
+    pi.registerProvider(
+      slotId,
+      currentSlotConfig as unknown as Parameters<typeof pi.registerProvider>[1],
+    );
+  }
+
+  const broadcastToMultiAccount = () => {
+    (pi as any).events?.emit?.("pi-multi-account:register-family", {
+      family: "antigravity",
+      label: "Gemini",
+      idPattern: /^antigravity(-account-\d+)?$/,
+      fetchUsageSnapshot: async (provider: string, _credential: any) => {
+        const apiKey = await getApiKeyForSlot(provider);
+        const usage = await fetchAccountUsage(apiKey);
+        const geminiGroup = usage.groups?.find((g) => /gemini/i.test(g.displayName || ""));
+        const bucket5h = geminiGroup?.buckets?.find((b) => /5\s*h/i.test(b.displayName || b.window || ""));
+        const bucketWeekly = geminiGroup?.buckets?.find((b) => /week|7\s*d/i.test(b.displayName || b.window || ""));
+        const primary = bucket5h
+          ? {
+              usedPercent: Math.round((1 - bucket5h.remainingFraction) * 100),
+              resetAt: bucket5h.resetTime ? Date.parse(bucket5h.resetTime) : Date.now() + 5 * 3600 * 1000,
+              windowSeconds: 5 * 3600,
+            }
+          : undefined;
+        const secondary = bucketWeekly
+          ? {
+              usedPercent: Math.round((1 - bucketWeekly.remainingFraction) * 100),
+              resetAt: bucketWeekly.resetTime ? Date.parse(bucketWeekly.resetTime) : Date.now() + 7 * 24 * 3600 * 1000,
+              windowSeconds: 7 * 24 * 3600,
+            }
+          : undefined;
+        return {
+          provider,
+          family: "antigravity",
+          fetchedAt: Date.now(),
+          account: usage.email,
+          plan: usage.planLabel || "Antigravity Subscription",
+          primary,
+          secondary,
+        };
+      },
+      qualityBand: (modelId: string) => {
+        const id = modelId.toLowerCase();
+        if (/flash|lite|nano/i.test(id)) return "fast";
+        if (/pro|ultra|opus/i.test(id)) return "frontier";
+        return "balanced";
+      },
+    });
+  };
+
+  broadcastToMultiAccount();
+  (pi as any).events?.on?.("pi-multi-account:ready", () => {
+    broadcastToMultiAccount();
+  });
 
   pi.registerCommand("antigravity.usage", {
     description: "Show Antigravity shared quota pools (Gemini / Claude+GPT, 5h + weekly)",

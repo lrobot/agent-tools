@@ -91,20 +91,42 @@ export function jsonOrTextError(text: string): string {
   return text;
 }
 
-export function parseApiKey(apiKeyRaw: string | undefined): AntigravityApiKey {
+export function parseApiKey(apiKeyRaw: unknown): AntigravityApiKey {
   if (!apiKeyRaw) {
     throw new Error("No Antigravity OAuth credentials. Run /login antigravity.");
   }
-  try {
-    const parsed = JSON.parse(apiKeyRaw) as Partial<AntigravityApiKey>;
-    if (!parsed.token || !parsed.projectId) throw new Error("missing token or projectId");
-    return { token: parsed.token, projectId: parsed.projectId };
-  } catch (error) {
-    throw new Error(
-      `Invalid Antigravity credentials. Run /login antigravity. (${safeError(error)})`,
-      { cause: error },
-    );
+  if (typeof apiKeyRaw === "object" && apiKeyRaw !== null && !("then" in apiKeyRaw)) {
+    const obj = apiKeyRaw as Record<string, unknown>;
+    const token =
+      typeof obj.token === "string"
+        ? obj.token
+        : typeof obj.access === "string"
+        ? obj.access
+        : undefined;
+    const projectId =
+      typeof obj.projectId === "string" ? obj.projectId : "aicode-consumers";
+    if (token) {
+      return { token, projectId };
+    }
   }
+  if (typeof apiKeyRaw === "string") {
+    try {
+      const parsed = JSON.parse(apiKeyRaw) as Partial<AntigravityApiKey>;
+      if (parsed.token) {
+        return {
+          token: parsed.token,
+          projectId: parsed.projectId || "aicode-consumers",
+        };
+      }
+    } catch {
+      if (apiKeyRaw.startsWith("ya29.")) {
+        return { token: apiKeyRaw, projectId: "aicode-consumers" };
+      }
+    }
+  }
+  throw new Error(
+    `Invalid Antigravity credentials. Run /login antigravity.`,
+  );
 }
 
 export function extractProjectId(data: unknown): string | undefined {

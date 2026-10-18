@@ -93,6 +93,7 @@ pi install npm:pi-proxy-router
 - `kimi-coding`：`auth.kimi.com/api/oauth/device_authorization`、`auth.kimi.com/api/oauth/token`
 - `openrouter`：`openrouter.ai/api/v1/auth/keys`
 - `xai`：`auth.x.ai/oauth2/device/code`、`auth.x.ai/oauth2/token`
+- `antigravity`：`oauth2.googleapis.com/token`（token 交换与刷新）、`www.googleapis.com/oauth2/v1/userinfo`（登录时的用户信息）
 
 会话内 `/login` 的 token exchange、refresh 和 device-code 请求会经过该规则。浏览器打开的授权页面不经过扩展；独立执行的 `pi auth ...` 也不会加载扩展，仍需使用 `HTTP_PROXY` / `HTTPS_PROXY` 等环境变量。
 

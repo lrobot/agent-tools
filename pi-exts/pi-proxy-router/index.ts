@@ -247,6 +247,10 @@ const AUTH_ENDPOINTS = [
   { provider: "kimi-coding", hostname: "auth.kimi.com", path: /^\/api\/oauth\/(?:device_authorization|token)$/ },
   { provider: "openrouter", hostname: "openrouter.ai", path: /^\/api\/v1\/auth\/keys$/ },
   { provider: "xai", hostname: "auth.x.ai", path: /^\/oauth2\/(?:device\/code|token)$/ },
+  // antigravity (Google OAuth): token exchange/refresh plus the userinfo
+  // lookup during login. The browser authorization page stays outside Pi.
+  { provider: "antigravity", hostname: "oauth2.googleapis.com", path: /^\/token$/ },
+  { provider: "antigravity", hostname: "www.googleapis.com", path: /^\/oauth2\/v1\/userinfo$/ },
 ];
 
 type ModelEndpointRoute = {

@@ -1,4 +1,18 @@
 import { antigravityEnv } from "./util.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+// Read proxy config from proxy-router.json
+function getProxyUrlForAuth(provider: string): string | null {
+  try {
+    const configPath = join(homedir(), ".pi", "agent", "proxy-router.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    return config?.auth?.[provider] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Node's built-in fetch keeps an idle socket for only 4 seconds unless the server
@@ -66,6 +80,21 @@ export async function antigravityFetch(
   input: string | URL,
   init: RequestInit = {},
 ): Promise<Response> {
+  const proxyUrl = getProxyUrlForAuth("antigravity");
+  if (proxyUrl) {
+    const oldHttpProxy = process.env.HTTP_PROXY;
+    const oldHttpsProxy = process.env.HTTPS_PROXY;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    try {
+      return await fetch(input, init);
+    } finally {
+      if (oldHttpProxy !== undefined) process.env.HTTP_PROXY = oldHttpProxy;
+      else delete process.env.HTTP_PROXY;
+      if (oldHttpsProxy !== undefined) process.env.HTTPS_PROXY = oldHttpsProxy;
+      else delete process.env.HTTPS_PROXY;
+    }
+  }
   const dispatcher = await getDispatcher();
   if (!dispatcher) return fetch(input, init);
   return fetch(input, { ...init, dispatcher } as DispatcherInit);

@@ -325,3 +325,56 @@ export async function failoverToNextAccount(
   }
   return undefined;
 }
+
+export function sortedStoredAccounts(): StoredAccount[] {
+  const store = loadAccountStore();
+  return sortedAccounts(store);
+}
+
+export function syncAllCredentials(): void {
+  syncCurrentAuth();
+  const store = loadAccountStore();
+  const sorted = sortedAccounts(store);
+  const auth = readAuthFile();
+  for (const k of Object.keys(auth)) {
+    if (/^antigravity-account-\d+$/.test(k)) {
+      delete auth[k];
+    }
+  }
+  sorted.forEach((account, idx) => {
+    const slotKey = idx === 0 ? "antigravity" : `antigravity-account-${idx + 1}`;
+    auth[slotKey] = {
+      type: "oauth",
+      email: account.email,
+      access: account.access,
+      refresh: account.refresh,
+      expires: account.expires,
+      projectId: account.projectId,
+    };
+  });
+  writePrivateJson(authPath(), auth);
+}
+
+export async function getApiKeyForSlot(slotId: string): Promise<string> {
+  const store = loadAccountStore();
+  const sorted = sortedAccounts(store);
+  let targetAccount: StoredAccount | undefined;
+  if (slotId === "antigravity") {
+    targetAccount = (store.activeAccountId ? store.accounts[store.activeAccountId] : undefined) || sorted[0];
+  } else {
+    const match = slotId.match(/^antigravity-account-(\d+)$/);
+    if (match) {
+      const idx = parseInt(match[1], 10) - 1;
+      targetAccount = sorted[idx];
+    }
+  }
+  if (!targetAccount) {
+    throw new Error(`No account found for slot ${slotId}`);
+  }
+  const fresh = await ensureFresh(targetAccount);
+  const email = fresh.email?.trim();
+  return JSON.stringify({
+    token: fresh.access,
+    projectId: fresh.projectId || defaultProjectId(email || "antigravity-default"),
+  });
+}

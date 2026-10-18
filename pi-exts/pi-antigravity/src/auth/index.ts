@@ -19,5 +19,8 @@ export {
   rememberAccount,
   removeAccount,
   updateRememberedAccount,
+  sortedStoredAccounts,
+  syncAllCredentials,
+  getApiKeyForSlot,
 } from "./accounts.js";
 export type { AccountSummary, StoredAccount } from "./accounts.js";
