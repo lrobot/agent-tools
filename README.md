@@ -46,7 +46,9 @@ exchange commits with upstreams:
 - Each upstream has a named remote in this repo (see `git remote -v`).
 - **Local modifications** to a subtree are committed on top, in this repo
   (currently: pi-antigravity per-provider proxy patch, pi-multi-account
-  custom-family-registry, pi-proxy-router antigravity OAuth endpoints).
+  custom-family-registry, pi-proxy-router antigravity OAuth endpoints +
+  npm-undici-by-path load so ProxyAgent survives Bun's `undici` builtin
+  aliasing — see anti-network-blocking.md in /opt/ops).
   Keep them as separate commits from subtree pulls so both directions stay
   clean.
 
