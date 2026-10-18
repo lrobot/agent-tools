@@ -1,0 +1,43 @@
+{
+  "name": "pi-proxy-router",
+  "version": "1.2.4",
+  "description": "Per-model and auth-flow proxy routing for pi with session commands (/proxy, /noproxy, /allproxy) and dedicated proxy-router.json rules",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "proxy",
+    "socks5",
+    "routing"
+  ],
+  "license": "MIT",
+  "author": "leench <leench@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leench/pi-proxy-router.git"
+  },
+  "type": "module",
+  "files": [
+    "index.ts",
+    "socks-dispatcher.ts",
+    "LICENSE",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "socks-proxy-agent": "^8.0.5",
+    "undici": "^7.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2"
+  }
+}
