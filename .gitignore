@@ -1,0 +1,12 @@
+node_modules/
+.cache/
+dist/
+.DS_Store
+*.log
+
+# The following are git subtrees (full upstream history preserved via
+# `git subtree add`); their content is tracked, not ignored - excluded here
+# only from the INITIAL commit so the prefix is free for subtree add.
+pi-exts/pi-antigravity/
+pi-exts/pi-multi-account/
+pi-exts/pi-proxy-router/

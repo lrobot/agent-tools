@@ -1,0 +1,42 @@
+# agent-tools: cross-machine home for the cld launcher sources, the shared
+# ts-lib helpers, and the pi extensions (yaml-providers, pi-antigravity,
+# pi-multi-account, pi-proxy-router). Designed to be cloned anywhere on any
+# machine (mac/Linux today, Windows later) - all runtime paths resolve via
+# os.homedir() conventions, never via machine-specific absolute paths:
+#
+#   ~/.local/bin/cld(.exe)      built launcher binary + cld.*.yaml instances
+#   ~/.local/bin/providers.yaml symlink -> pi-exts/yaml-providers/providers.yaml
+#   ~/.agent_instances.yaml     instance defs, synced via personal dotfiles
+#
+# ~/.dotc/ keeps only the compiled binary's historical docs (doc/) and is no
+# longer the home of these sources.
+#
+# Task scripts live in scripts/ (real script files, not inline TOML, so each
+# is syntax-highlightable and free of shell-escaping puzzles - notably the
+# Windows default inline shell is `cmd /c`, which runs only the FIRST line of
+# a multiline string). Each task has a .sh (POSIX) and .ps1 (Windows) half,
+# dispatched via run/run_windows.
+
+[tools]
+bun = "latest"
+
+[tasks.build-cld]
+description = "Build the cld launcher into ~/.local/bin and register shell completion"
+run = "./scripts/build-cld.sh"
+run_windows = "pwsh -NoProfile -File ./scripts/build-cld.ps1"
+
+[tasks.setup-providers-link]
+description = "Symlink ~/.local/bin/providers.yaml to this repo's providers.yaml"
+run = "./scripts/setup-providers-link.sh"
+run_windows = "pwsh -NoProfile -File ./scripts/setup-providers-link.ps1"
+
+[tasks.setup-omp-ext]
+description = "Link the yaml-providers extension into oh-my-pi and install its npm deps"
+run = "./scripts/setup-omp-ext.sh"
+
+[tasks.postinstall-all]
+description = "Run all postinstall setup tasks"
+depends = ["build-cld", "setup-providers-link", "setup-omp-ext"]
+
+[hooks]
+postinstall = { task = "postinstall-all" }

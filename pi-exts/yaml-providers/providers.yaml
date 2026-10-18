@@ -1,0 +1,141 @@
+#anthropic_provider_name 大语言模型 API 提供商及模型列表配置文件（国内主流大模型补充）
+openai:
+  name: "OpenAI"
+  base_url: "https://api.openai.com"
+  base_url_v1: https://api.openai.com/v1
+  documentation: "https://platform.openai.com/docs"
+anthropic:
+  name: "Anthropic"
+  base_url: "https://api.anthropic.com" #ANTHROPIC_BASE_URL
+  base_url_v1: https://api.anthropic.com/v1
+  anthropic_url: "https://api.anthropic.com/v1/messages"
+  documentation: "https://docs.anthropic.com"
+globalai:
+  name: "globalai"
+  max_context_ref: "https://models.dev/api.json"
+  base_url: "https://globalai.vip"
+  base_url_v1: https://globalai.vip/v1
+  models_url: https://globalai.vip/v1/models
+  openapi_response_url: https://globalai.vip/v1/responses
+  anthropic_url: https://globalai.vip/v1/messages
+  openai_completion_url: https://globalai.vip/v1/chat/completions
+  documentation: https://doc.newapi.pro/en/api/anthropic-chat/
+cliproxyapi:
+  name: "cliproxyapi"
+  #base_url: "http://100.99.166.42:8317"
+  base_url: "https://llm-proxy.jasm.top"
+  base_url_v1: "https://llm-proxy.jasm.top/v1"
+  models_url: "https://llm-proxy.jasm.top/v1/models"
+  #models_url: "http://100.99.166.42:8317/v1/models"
+  documentation: "https://help.router-for.me/agent-client/claude-code.html"
+agnes:
+  name: "agnes"
+  base_url: "https://apihub.agnes-ai.com"
+  base_url_v1: "https://apihub.agnes-ai.com/v1"
+  models_url: "https://apihub.agnes-ai.com/v1/models"
+  secret_use_as_auth_token: true
+  documentation: "https://www.agnes-ai.com/zh-Hans/docs/cid3 maybe not support anthropic,need ccswitch"
+aliplan:
+  name: "Alibaba TokenPlan"
+  max_context_ref: "https://models.dev/api.json"
+  base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
+  base_url_v1: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1"
+  models_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/models"
+  documentation: "https://bailian.console.aliyun.com/cn-beijing?tab=plan&commonbuy=1&orderType=buy#/efm/subscription/token-plan/personal"
+aliyuncs:
+  name: "Alibaba Cloud Model Studio (阿里云百炼)"
+  max_context_ref: "https://models.dev/api.json"
+  base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
+  base_url_v1: "https://dashscope.aliyuncs.com/apps/anthropic/v1"
+  models_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+  documentation: "https://help.aliyun.com/zh/model-studio/"
+  models:
+    qwen-max: "qwen-max"
+    qwen-plus: "qwen-plus"
+    qwen-turbo: "qwen-turbo"
+tencent: #https://cloud.tencent.com/document/product/1823/131903
+  name: "Tencent Hunyuan (腾讯混元)"
+  max_context_ref: "https://models.dev/api.json"
+  base_url: "https://tokenhub.tencentmaas.com"
+  base_url_v1: "https://tokenhub.tencentmaas.com/v1"
+  documentation: "https://cloud.tencent.com/document/product/1823/130078"
+  models:
+    hunyuan-pro: "hy3"
+    glm-5.2: "glm-5.2"
+    deepseek-v4-pro: "deepseek-v4-pro"
+volcengine:
+  name: "Volcengine Ark (火山方舟)"
+  base_url: "https://ark.cn-beijing.volces.com/api/compatible"
+  base_url_v1: "https://ark.cn-beijing.volces.com/api/compatible/v1"
+  #models_url: "https://ark.cn-beijing.volces.com/api/v3/"
+  documentation: "https://www.volcengine.com/docs/82379"
+  # 注意：火山引擎调用通常绑定特定的推理接入点 ID，而非全局通用短名
+bigmodel:
+  name: "Zhipu AI (智谱大模型平台)"
+  max_context_ref: "https://models.dev/api.json"
+  base_url: "https://open.bigmodel.cn/api/anthropic"
+  base_url_v1: "https://open.bigmodel.cn/api/anthropic/v1"
+  openai_completion_url: https://open.bigmodel.cn/api/paas/v4/chat/completions
+  anthorpic_url: https://open.bigmodel.cn/api/anthropic/v1/messages
+  openapi_response_url: https://open.bigmodel.cn/api/v1/response
+  documentation: "https://docs.bigmodel.cn"
+kimi:
+  name: "Moonshot AI (月之暗面 Kimi)"
+  base_url: "https://api.moonshot.cn/anthropic"
+  base_url_v1: "https://api.moonshot.cn/anthropic/v1"
+  models_url: "https://api.moonshot.cn/v1/models"
+  documentation: "https://platform.kimi.com/docs/guide/claude-code-kimi"
+kimicoding:
+  name: "Moonshot AI (月之暗面 Kimi)"
+  base_url: "https://api.kimi.com/coding/"
+  base_url_v1: "https://api.kimi.com/coding/v1"
+  models_url: "https://api.kimi.com/coding/v1/models"
+  documentation: "https://platform.kimi.com/docs/guide/claude-code-kimi"
+  secret_use_as_auth_token: true
+xiaomi:
+  name: "Xiaomi MiMo (小米大模型开放平台)"
+  base_url: "https://api.xiaomimimo.com"
+  base_url_v1: "https://api.xiaomimimo.com/v1"
+  documentation: "https://mimo.mi.com/docs/"
+  models:
+    mimo-v2-5-pro: "mimo-v2.5-pro"
+    mimo-v2-5: "mimo-v2.5"
+    mimo-v2-5-asr: "mimo-v2.5-asr"
+google:
+  name: "Google Gemini"
+  base_url: "https://generativelanguage.googleapis.com/v1beta"
+  documentation: "https://ai.google.dev/gemini-api/docs"
+mmpg:
+  name: "MiniMax PayGo"
+  base_url: "https://api.minimaxi.com/anthropic"
+  base_url_v1: "https://api.minimaxi.com/anthropic/v1"
+  models_url: "https://api.minimaxi.com/v1/models"
+  documentation: "https://platform.minimaxi.com/docs/api-reference/text-anthropic-api"
+mmplan:
+  name: "MiniMax Plan"
+  base_url: "https://api.minimaxi.com/anthropic"
+  base_url_v1: "https://api.minimaxi.com/anthropic/v1"
+  models_url: "https://api.minimaxi.com/v1/models"
+  documentation: "https://platform.minimaxi.com/console/plan"
+deepseek:
+  name: "DeepSeek"
+  base_url: "https://api.deepseek.com/anthropic"
+  base_url_v1: "https://api.deepseek.com/anthropic/v1"
+  models_url: "https://api.deepseek.com/v1/models"
+  documentation: "https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code/"
+groq:
+  name: "Groq"
+  base_url: "https://api.groq.com/openai/v1"
+  documentation: "https://console.groq.com/docs"
+  models:
+    llama-3-3-70b: "llama-3.3-70b-versatile"
+    mixtral-8x7b: "mixtral-8x7b-32768"
+openrouter:
+  name: "OpenRouter"
+  base_url: "https://openrouter.ai/api"
+  base_url_v1: "https://openrouter.ai/api/v1"
+  documentation: "https://openrouter.ai/docs"
+  # OpenRouter 聚合了大量模型，短名称映射可以精简为你常用的几个
+  models:
+    meta-llama-3-3-70b: "meta-llama/llama-3.3-70b-instruct"
+    qwen-2-5-72b: "qwen/qwen-2.5-72b-instruct"

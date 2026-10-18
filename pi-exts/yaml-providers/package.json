@@ -1,0 +1,10 @@
+{
+  "name": "pi-ext-dotc-providers",
+  "private": true,
+  "dependencies": {
+    "yaml": "^2.6.0"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

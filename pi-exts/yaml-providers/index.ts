@@ -1,0 +1,189 @@
+import os from "os";
+import path from "path";
+import {
+  isInstanceInProfile,
+  loadInstances,
+  loadProviders,
+  loadSecrets,
+  resolveInstancesYaml,
+  resolveProvidersYaml,
+  type InstanceEntry,
+  type ProviderEntry,
+} from "./config";
+import { getModelIds } from "./models";
+import { getContextRef, lookupContextRef, type ContextRefEntry } from "./contextRef";
+// Type-only import: erased at transpile time, so it never hits jiti's runtime
+// resolver - safe even though index.ts must not RUNTIME-import from
+// ../../ts-lib/lib directly (see the comment in contextRef.ts).
+import type { LiveModel } from "../../ts-lib/lib";
+
+// Cross-machine config locations (see ts-lib/lib.ts resolve*Yaml for the full
+// rationale): instances is a home-dir dotfile synced via dotfiles; providers
+// lives in this repo and is reached through a per-machine symlink
+// ~/.local/bin/providers.yaml -> <repo>/pi-exts/yaml-providers/providers.yaml
+// created by the setup-providers-link mise task.
+const CACHE_DIR = path.join(os.homedir(), ".cache", "yaml-providers");
+const PROVIDERS_YAML = resolveProvidersYaml();
+const INSTANCES_YAML = resolveInstancesYaml();
+const SECRETS_YAML = path.join(os.homedir(), ".ssh", "secret.yaml");
+const TTL_MS = 24 * 60 * 60 * 1000;
+
+// Placeholder defaults for models whose /models listing doesn't expose
+// context/output-token limits (most providers - see design_pi_extension.md
+// §5). Real values from the live response (or cache) win when present.
+const DEFAULT_CONTEXT_WINDOW = 128000;
+const DEFAULT_MAX_TOKENS = 8192;
+
+type ModelConfig = ReturnType<typeof toModelConfigs>[number];
+
+// contextRefFor: optional lookup into a provider's `max_context_ref` catalog
+// (see cld-ts/lib.ts's lookupContextRef) - only consulted when the live
+// /models listing itself didn't say (contextWindow/maxTokens undefined).
+// Precedence is therefore: live value > max_context_ref > placeholder default.
+export function toModelConfigs(models: LiveModel[], contextRefFor?: (id: string) => ContextRefEntry) {
+  return models.map(({ id, contextWindow, maxTokens, reasoning, images }) => {
+    const ref = contextWindow === undefined || maxTokens === undefined ? contextRefFor?.(id) ?? {} : {};
+    return {
+      id,
+      name: id,
+      // Unknown (most providers don't expose this) defaults to false/text-only,
+      // same conservative default as before - only flips to true when the
+      // live listing says so explicitly.
+      reasoning: reasoning ?? false,
+      input: images ? ["text", "image"] : ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: contextWindow ?? ref.context ?? DEFAULT_CONTEXT_WINDOW,
+      maxTokens: maxTokens ?? ref.output ?? DEFAULT_MAX_TOKENS,
+    };
+  });
+}
+
+export function groupModelsByApi(models: ModelConfig[]) {
+  const groups = new Map<"openai-completions" | "anthropic-messages", ModelConfig[]>();
+  for (const model of models) {
+    const api = /^(gpt|codex)/i.test(model.name) ? "openai-completions" : "anthropic-messages";
+    const group = groups.get(api) ?? [];
+    group.push(model);
+    groups.set(api, group);
+  }
+  return groups;
+}
+
+export function resolveBaseUrlV1(provider: Pick<ProviderEntry, "base_url" | "base_url_v1">) {
+  //return provider.base_url_v1 ?? `${provider.base_url.replace(/\/$/, "")}/v1`;
+  return provider.base_url;
+}
+
+interface BuildResult {
+  warning?: string;
+  registrations?: Array<{ id: string; config: Record<string, unknown> }>;
+}
+
+async function buildProviderConfig(
+  instanceName: string,
+  inst: InstanceEntry,
+  providers: Record<string, ProviderEntry>,
+  secrets: Record<string, { secret: string }>,
+  opts?: { force?: boolean },
+): Promise<BuildResult> {
+  const provider = providers[inst.provider_name];
+  if (!provider) return { warning: `instance ${instanceName}: unknown provider ${inst.provider_name}` };
+
+  const secretEntry = secrets[inst.secret_key_name];
+  if (!secretEntry?.secret) return { warning: `instance ${instanceName}: no secret for ${inst.secret_key_name}` };
+
+  // Detect first, static models: block (if any) is only the fallback when
+  // live detection (fresh cache or fetch) comes back empty - mirrors
+  // cld-ts/core.ts's runModelSelect. See design_pi_extension.md §4.
+  const r = await getModelIds(instanceName, provider.base_url, provider.models_url, secretEntry.secret, {
+    cacheDir: CACHE_DIR,
+    ttlMs: TTL_MS,
+    force: opts?.force,
+    staticIds: provider.models ? Object.values(provider.models) : undefined,
+  });
+
+  // Only fetched when the provider opts in - most providers' /models listing
+  // already publishes real limits and never needs this (see design_pi_extension.md).
+  let contextRefFor: ((id: string) => ContextRefEntry) | undefined;
+  let contextRefWarning: string | undefined;
+  if (provider.max_context_ref) {
+    const ref = await getContextRef(provider.max_context_ref, {
+      cacheDir: CACHE_DIR,
+      ttlMs: TTL_MS,
+      force: opts?.force,
+    });
+    contextRefWarning = ref.warning;
+    contextRefFor = (id) => lookupContextRef(ref.catalog, id);
+  }
+
+  const baseUrl = resolveBaseUrlV1(provider);
+  const registrations = [...groupModelsByApi(toModelConfigs(r.models, contextRefFor))].map(([api, models]) => ({
+    id: `dotc-${instanceName}-${api}`,
+    config: {
+      name: provider.name ?? instanceName,
+      baseUrl,
+      apiKey: secretEntry.secret,
+      api,
+      authHeader: !!provider.secret_use_as_auth_token && api === "anthropic-messages",
+      models,
+    },
+  }));
+
+  return {
+    warning: [r.warning, contextRefWarning].filter(Boolean).join("; ") || undefined,
+    registrations,
+  };
+}
+
+function registerResult(pi: any, result: BuildResult) {
+  for (const registration of result.registrations ?? []) {
+    pi.registerProvider(registration.id, registration.config);
+  }
+}
+
+export default async function (pi: any) {
+  const providers = loadProviders(PROVIDERS_YAML);
+  const instances = loadInstances(INSTANCES_YAML);
+  const secrets = loadSecrets(SECRETS_YAML);
+  const warnings: string[] = [];
+
+  await Promise.all(
+    Object.entries(instances).map(async ([name, inst]) => {
+      if (!isInstanceInProfile(inst)) return;
+      const result = await buildProviderConfig(name, inst, providers, secrets);
+      if (result.warning) warnings.push(result.warning);
+      registerResult(pi, result);
+    }),
+  );
+
+  if (warnings.length) {
+    pi.on("session_start", (_event: unknown, ctx: any) => {
+      for (const w of warnings) ctx.ui.notify(w, "warning");
+    });
+  }
+
+  pi.registerCommand("modelreload", {
+    description: "Force-refresh live model lists for dotc providers, bypassing the cache",
+    handler: async (args: string, ctx: any) => {
+      const activeTargets = Object.keys(instances).filter((name) => isInstanceInProfile(instances[name]));
+      const targets = args.trim() ? [args.trim()] : activeTargets;
+      for (const name of targets) {
+        if (!instances[name] || !isInstanceInProfile(instances[name])) {
+          ctx.ui.notify(`modelreload: unknown or inactive instance ${name}`, "warning");
+          continue;
+        }
+        const result = await buildProviderConfig(name, instances[name], providers, secrets, { force: true });
+        if (result.warning) {
+          ctx.ui.notify(`modelreload ${name}: ${result.warning}`, "warning");
+        }
+        if (result.registrations?.length) {
+          registerResult(pi, result);
+          const count = result.registrations.reduce((sum, registration) => {
+            return sum + ((registration.config.models as unknown[] | undefined)?.length ?? 0);
+          }, 0);
+          ctx.ui.notify(`modelreload ${name}: ok (${count} models)`, "info");
+        }
+      }
+    },
+  });
+}
