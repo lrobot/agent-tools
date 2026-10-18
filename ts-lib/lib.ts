@@ -204,8 +204,29 @@ export function secretHint(id: string): string {
 // launching that instead lets the CLI reach the network directly. Fatal on
 // mac/Linux (proven, load-bearing today); non-fatal on Windows (unverified
 // whether Clash Verge keys on process name the same way).
+//
+// Finding the binary to copy is NOT a plain PATH scan: mise's shims dir
+// (~/AppData/Local/mise/shims on Windows) holds a generic dispatcher stub
+// per bin name, byte-identical regardless of name, which decides what to
+// run by reading its OWN filename. A raw findInPath("claude") lands on that
+// stub whenever the shims dir precedes the versioned install dir on PATH
+// (any shell without mise's install-dir PATH prepending, i.e. no
+// `mise activate`) - copying it to `cldbin` just yields another dispatcher
+// stub for a name mise never registered, which fails with "No version is
+// set for shim: cldbin" no matter how it's invoked. `mise which claude`
+// resolves straight to the real installed binary regardless of PATH order,
+// so prefer it and only fall back to the PATH scan if mise itself isn't
+// on PATH.
+function findRealClaudeBinary(): string | null {
+  try {
+    const out = execFileSync("mise", ["which", "claude"], { encoding: "utf8" }).trim();
+    if (out && existsSync(out)) return out;
+  } catch {}
+  return findInPath("claude");
+}
+
 export function resolveClaudeBinary(): string {
-  const claudeBin = findInPath("claude");
+  const claudeBin = findRealClaudeBinary();
   if (!claudeBin) {
     console.error("ERROR: claude binary not found in PATH");
     process.exit(1);
