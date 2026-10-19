@@ -510,6 +510,39 @@ function routeStreamOptions(
   return routedOptions;
 }
 
+// Bun runtime detection. pi is a Bun-compiled binary; pi 1.3.0 embeds Bun
+// 1.3.14, whose event loop never wakes npm-undici socket reads after the first
+// buffered chunk: response headers (and any body bytes that arrived with
+// them) come through, but reader.read() then hangs forever on streaming
+// bodies — pi drains its event loop and exits 0 with an empty assistant
+// message. Small non-streaming responses survive only because their whole
+// body arrives in the initial read. Bun's native fetch with its `proxy`
+// option streams correctly on those same versions, so http(s) proxies are
+// handled through the native path when running under Bun. Node keeps the
+// npm-undici path (the require-by-directory trick above exists precisely
+// because Bun aliases bare "undici" imports to its builtin copy).
+const isBun =
+  typeof process !== "undefined" &&
+  typeof (process.versions as Record<string, string> | undefined)?.bun === "string";
+
+function makeBunProxyFetch(proxyUrl: string): NonNullable<StreamOptions["fetch"]> {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    // init.dispatcher targets npm undici; Bun's native fetch takes `proxy`.
+    const { dispatcher: _omit, ...rest } = (init ?? {}) as RequestInit & {
+      dispatcher?: unknown;
+    };
+    try {
+      return (await globalThis.fetch(input as never, {
+        ...rest,
+        proxy: proxyUrl,
+      } as never)) as unknown as Response;
+    } catch (err) {
+      logError("proxyFetch (bun native) failed:", err);
+      throw err;
+    }
+  }) as NonNullable<StreamOptions["fetch"]>;
+}
+
 // Per-model route decision plus the fetch bound to that route's dispatcher.
 // Undefined means the model has no rule, so callers keep the options as-is.
 function modelFetchRoute(
@@ -519,18 +552,23 @@ function modelFetchRoute(
   const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
   if (!route.matched) return undefined;
 
-  const dispatcher = getRouteDispatcher(route.url);
-  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    try {
-      return (await undiciFetch(input as never, {
-        ...(init as Record<string, unknown>),
-        dispatcher: dispatcher as never,
-      } as never)) as unknown as Response;
-    } catch (err) {
-      logError("proxyFetch failed:", err);
-      throw err;
-    }
-  }) as NonNullable<StreamOptions["fetch"]>;
+  let fetch: NonNullable<StreamOptions["fetch"]>;
+  if (isBun && route.url !== null && /^https?:\/\//i.test(route.url)) {
+    fetch = makeBunProxyFetch(route.url);
+  } else {
+    const dispatcher = getRouteDispatcher(route.url);
+    fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      try {
+        return (await undiciFetch(input as never, {
+          ...(init as Record<string, unknown>),
+          dispatcher: dispatcher as never,
+        } as never)) as unknown as Response;
+      } catch (err) {
+        logError("proxyFetch failed:", err);
+        throw err;
+      }
+    }) as NonNullable<StreamOptions["fetch"]>;
+  }
 
   log(`route: ${model.provider}/${model.id} -> ${displayProxyUrl(route.url)}`);
   return { fetch, url: route.url };
