@@ -218,3 +218,145 @@ test("lookupContextRef returns {} for a model id not present in the catalog", ()
   const catalog = parseContextRefCatalog(JSON.stringify({ a: { models: { m: { limit: { context: 1000 } } } } }));
   expect(lookupContextRef(catalog, "unknown")).toEqual({ context: undefined, output: undefined });
 });
+
+// ── getContextRefSync (sync cache + fetch used by cld-ts) ────────────────
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import path from "path";
+import {
+  getContextRefSync,
+  readContextRefCache,
+  resolveClaudeContextWindow,
+  writeContextRefCache,
+  type ContextRefFetchResult,
+} from "./lib";
+
+function withTempCacheDir(fn: (dir: string) => void): void {
+  const dir = mkdtempSync(path.join(tmpdir(), "cld-ctxref-test-"));
+  try {
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function fakeCatalog() {
+  return new Map([["m", [{ context: 262144, output: 8192 }]]]);
+}
+
+test("getContextRefSync fetches and writes the cache on a cold cache", () => {
+  withTempCacheDir((dir) => {
+    let calls = 0;
+    const fetchFn = (): ContextRefFetchResult => {
+      calls++;
+      return { ok: true, catalog: fakeCatalog(), url: "u" };
+    };
+    const r = getContextRefSync("https://example.com/api.json", { cacheDir: dir, fetchFn });
+    expect(calls).toBe(1);
+    expect(r.warning).toBeUndefined();
+    expect(r.catalog.get("m")?.[0]?.context).toBe(262144);
+    expect(readContextRefCache(dir, "https://example.com/api.json")).not.toBeNull();
+  });
+});
+
+test("getContextRefSync serves a fresh cache without fetching", () => {
+  withTempCacheDir((dir) => {
+    writeContextRefCache(dir, "https://example.com/api.json", fakeCatalog());
+    let calls = 0;
+    const fetchFn = (): ContextRefFetchResult => {
+      calls++;
+      return { ok: false, error: "should not be called", url: "u" };
+    };
+    const r = getContextRefSync("https://example.com/api.json", { cacheDir: dir, fetchFn });
+    expect(calls).toBe(0);
+    expect(r.catalog.get("m")?.[0]?.context).toBe(262144);
+  });
+});
+
+test("getContextRefSync falls back to a stale cache with a warning on fetch failure", () => {
+  withTempCacheDir((dir) => {
+    writeContextRefCache(dir, "https://example.com/api.json", fakeCatalog());
+    // Rewrite with an old timestamp so the TTL check fails.
+    const stale = readContextRefCache(dir, "https://example.com/api.json")!;
+    const file = path.join(dir, "_context_ref_https_example_com_api_json.json");
+    require("fs").writeFileSync(
+      file,
+      JSON.stringify({ fetchedAt: stale.fetchedAt - 48 * 60 * 60 * 1000, catalog: Object.fromEntries(stale.catalog) }),
+    );
+    const r = getContextRefSync("https://example.com/api.json", {
+      cacheDir: dir,
+      fetchFn: () => ({ ok: false, error: "HTTP 500", url: "u" }),
+    });
+    expect(r.catalog.get("m")?.[0]?.context).toBe(262144);
+    expect(r.warning).toContain("stale cache");
+  });
+});
+
+test("getContextRefSync returns an empty catalog with a warning when fetch fails and no cache exists", () => {
+  withTempCacheDir((dir) => {
+    const r = getContextRefSync("https://example.com/api.json", {
+      cacheDir: dir,
+      fetchFn: () => ({ ok: false, error: "HTTP 500", url: "u" }),
+    });
+    expect(r.catalog.size).toBe(0);
+    expect(r.warning).toContain("no cache available");
+  });
+});
+
+// ── resolveClaudeContextWindow (claude context hand-off) ─────────────────
+
+test("resolveClaudeContextWindow appends [1m] for a 1M-window custom model", () => {
+  expect(resolveClaudeContextWindow("deepseek-v4-pro", 1048576)).toEqual({
+    modelId: "deepseek-v4-pro[1m]",
+    maxContextTokens: undefined,
+    appended1m: true,
+  });
+});
+
+test("resolveClaudeContextWindow does not double-append [1m]", () => {
+  expect(resolveClaudeContextWindow("deepseek-v4-pro[1m]", 1048576)).toEqual({
+    modelId: "deepseek-v4-pro[1m]",
+    maxContextTokens: undefined,
+    appended1m: false,
+  });
+});
+
+test("resolveClaudeContextWindow yields MAX_CONTEXT_TOKENS for a sub-1M custom ID", () => {
+  expect(resolveClaudeContextWindow("qwen3.7-plus", 262144)).toEqual({
+    modelId: "qwen3.7-plus",
+    maxContextTokens: 262144,
+    appended1m: false,
+  });
+});
+
+test("resolveClaudeContextWindow leaves claude-recognized IDs alone (no env override)", () => {
+  // bare claude-* name
+  expect(resolveClaudeContextWindow("claude-sonnet-5", 200000)).toEqual({
+    modelId: "claude-sonnet-5",
+    maxContextTokens: undefined,
+    appended1m: false,
+  });
+  // vendor-prefixed ID that contains a known claude model name
+  expect(resolveClaudeContextWindow("anthropic/claude-sonnet-5", 1000000)).toEqual({
+    modelId: "anthropic/claude-sonnet-5[1m]",
+    maxContextTokens: undefined,
+    appended1m: true,
+  });
+});
+
+test("resolveClaudeContextWindow passes the ID through unchanged when the window is unknown", () => {
+  expect(resolveClaudeContextWindow("my-custom-model", undefined)).toEqual({
+    modelId: "my-custom-model",
+    maxContextTokens: undefined,
+    appended1m: false,
+  });
+  expect(resolveClaudeContextWindow("my-custom-model[1m]", undefined).modelId).toBe("my-custom-model[1m]");
+});
+
+test("resolveClaudeContextWindow keeps a user-tagged [1m] and emits no env for a sub-1M reading", () => {
+  expect(resolveClaudeContextWindow("my-custom-model[1m]", 256000)).toEqual({
+    modelId: "my-custom-model[1m]",
+    maxContextTokens: undefined,
+    appended1m: false,
+  });
+});

@@ -14,16 +14,21 @@ import {
   fetchLiveModels,
   findInPath,
   fzfPick,
+  getContextRefSync,
   getSecret,
+  lookupContextRef,
   promptSync,
   requireYq,
   resolveClaudeBinary,
+  resolveClaudeContextWindow,
   resolveInstancesYaml,
   resolveProvidersYaml,
   secretHint,
   yqGet,
   yqGetNested,
   yqKeys,
+  type ContextRefCatalog,
+  type LiveModel,
 } from "../ts-lib/lib";
 
 // ── argv parsing: `cld <instance> [claude args...]` ───────────────────────
@@ -126,12 +131,17 @@ function runModelSelect(binDir: string, instance: string, provider: string, prov
   let ids: string[] = [];
   let names: string[] = [];
   let sourceLabel: string;
+  // Per-model metadata from the live /models listing (contextWindow/maxTokens
+  // when the provider publishes them) - used below to hand claude the real
+  // context window instead of letting it assume 200K for an unrecognized ID.
+  const liveById = new Map<string, LiveModel>();
 
   const live = fetchLiveModels(baseUrl, apiKey, modelsUrl);
   if (live.ok) {
     ids = live.ids;
     names = live.ids;
     sourceLabel = `live ${live.source}-compatible API (${live.url})`;
+    for (const m of live.models) liveById.set(m.id, m);
   } else {
     // `.models // {}` matters: a provider with no models: block yields null,
     // and `null | keys` makes yq bail with "cannot get keys of !!null" - which
@@ -206,12 +216,45 @@ function runModelSelect(binDir: string, instance: string, provider: string, prov
     }
   }
 
+  // Optional max_context_ref catalog (models.dev-shaped) as the fallback for
+  // providers whose /models listing doesn't publish context limits - same
+  // source and precedence as pi-exts/yaml-providers (live > ref > unknown).
+  const maxContextRefUrl = yqGet(providersYaml, provider, '.max_context_ref // ""');
+  let contextRefCatalog: ContextRefCatalog | null = null;
+  if (maxContextRefUrl) {
+    const r = getContextRefSync(maxContextRefUrl, {});
+    if (r.warning) console.log(`(${r.warning})`);
+    contextRefCatalog = r.catalog;
+  }
+
+  const resolveWindow = (id: string): number | undefined => {
+    const bare = id.replace(/(\[1m\])+$/i, "").trim();
+    const liveWin = liveById.get(bare)?.contextWindow ?? liveById.get(id)?.contextWindow;
+    if (liveWin !== undefined) return liveWin;
+    if (contextRefCatalog) return lookupContextRef(contextRefCatalog, bare).context;
+    return undefined;
+  };
+
   const lines = [`instance: ${instance}`, `provider: ${provider}`, "models:"];
-  for (const v of MODEL_VARS) lines.push(`  ${v}: "${chosen[v]}"`);
+  const contextLines: string[] = [];
+  const windowNotes: string[] = [];
+  for (const v of MODEL_VARS) {
+    const win = resolveWindow(chosen[v]);
+    const res = resolveClaudeContextWindow(chosen[v], win);
+    lines.push(`  ${v}: "${res.modelId}"`);
+    if (res.maxContextTokens !== undefined) contextLines.push(`  ${v}: ${res.maxContextTokens}`);
+    if (res.appended1m) windowNotes.push(`  ${v}: ${chosen[v]} -> ${res.modelId} (1M window)`);
+    else if (res.maxContextTokens !== undefined) windowNotes.push(`  ${v}: ${res.modelId} -> context ${res.maxContextTokens}`);
+  }
+  if (contextLines.length > 0) lines.push("context:", ...contextLines);
   writeFileSync(cfgYaml, lines.join("\n") + "\n", "utf8");
 
   console.log("");
   console.log(`Saved: ${cfgYaml}`);
+  if (windowNotes.length > 0) {
+    console.log("Detected context windows:");
+    for (const note of windowNotes) console.log(note);
+  }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────
@@ -245,7 +288,12 @@ function main(): void {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: undefined,
       ANTHROPIC_DEFAULT_SONNET_MODEL: undefined,
       ANTHROPIC_DEFAULT_OPUS_MODEL: undefined,
+      ANTHROPIC_DEFAULT_FABLE_MODEL: undefined,
       CLAUDE_CODE_SUBAGENT_MODEL: undefined,
+      // Official mode talks to api.anthropic.com with recognized model IDs, so
+      // a context-window override left over from a parent cld session would
+      // only take effect with DISABLE_COMPACT anyway - drop it for hygiene.
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: undefined,
     });
     launch(claudeBin, parsed.rest, env);
     return;
@@ -305,11 +353,32 @@ function main(): void {
   for (const v of MODEL_VARS) {
     const val = yqGetNested(cfgYaml, "models", v, "");
     if (!val) {
-      console.error(`ERROR: ${v} not set in ${cfgYaml}, run: cld ${instance} _modelselect`);
-      process.exit(1);
+      // Only the primary model is mandatory. Optional slots (e.g.
+      // ANTHROPIC_DEFAULT_FABLE_MODEL, added after older cld.*.yaml files were
+      // written) are skipped so a stale config keeps working.
+      if (v === "ANTHROPIC_MODEL") {
+        console.error(`ERROR: ${v} not set in ${cfgYaml}, run: cld ${instance} _modelselect`);
+        process.exit(1);
+      }
+      continue;
     }
     modelEnv[v] = val;
   }
+
+  // Hand claude the real context window for a custom/gateway model ID, using
+  // the windows detected at _modelselect time (persisted in the yaml's
+  // context: section). >=1M windows were already handled by the [1m] suffix
+  // baked into the model ID; here we only need CLAUDE_CODE_MAX_CONTEXT_TOKENS
+  // for a sub-1M custom spelling of the primary model. resolveClaudeContextWindow
+  // re-applies the same guards (no override for claude-recognized IDs or
+  // [1m]-tagged IDs), and `undefined` makes buildEnv delete any stale value
+  // inherited from a parent process.
+  const primaryWindowStr = yqGetNested(cfgYaml, "context", "ANTHROPIC_MODEL", "");
+  const primaryWindow = Number.parseInt(primaryWindowStr, 10);
+  const primaryResolution = resolveClaudeContextWindow(
+    modelEnv.ANTHROPIC_MODEL ?? "",
+    Number.isFinite(primaryWindow) && primaryWindow > 0 ? primaryWindow : undefined,
+  );
 
   const claudeConfigDir = path.join(process.env.HOME ?? process.env.USERPROFILE ?? "", ".claude");
   mkdirSync(claudeConfigDir, { recursive: true });
@@ -322,6 +391,8 @@ function main(): void {
     ANTHROPIC_AUTH_TOKEN: useAuthToken ? apiKey : undefined,
     ANTHROPIC_API_KEY: useAuthToken ? undefined : apiKey,
     ...modelEnv,
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS:
+      primaryResolution.maxContextTokens !== undefined ? String(primaryResolution.maxContextTokens) : undefined,
     CLAUDE_CONFIG_DIR: claudeConfigDir,
     CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
     CLAUDE_CODE_AUTO_MODE_SERVER: "0",
@@ -335,7 +406,12 @@ function main(): void {
       : "auth: ANTHROPIC_API_KEY (x-api-key), ANTHROPIC_AUTH_TOKEN cleared",
   );
   console.log(`models (from ${cfgYaml}):`);
-  for (const v of MODEL_VARS) console.log(`  ${v}=${modelEnv[v]}`);
+  for (const v of MODEL_VARS) if (modelEnv[v]) console.log(`  ${v}=${modelEnv[v]}`);
+  if (primaryResolution.maxContextTokens !== undefined) {
+    console.log(`context: CLAUDE_CODE_MAX_CONTEXT_TOKENS=${primaryResolution.maxContextTokens} (from ${cfgYaml} context: section)`);
+  } else if (/\[1m\]$/i.test(modelEnv.ANTHROPIC_MODEL ?? "")) {
+    console.log("context: 1M via [1m] suffix on ANTHROPIC_MODEL (client-side, stripped before the gateway)");
+  }
 
   launch(claudeBin, ["--dangerously-skip-permissions", ...parsed.rest], env);
 }

@@ -6,10 +6,12 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "fs";
 import { homedir, tmpdir } from "os";
 import path from "path";
@@ -525,6 +527,139 @@ export function fetchContextRefCatalog(url: string): ContextRefFetchResult {
   } catch (e: any) {
     return { ok: false, error: `parse error: ${e?.message ?? String(e)}`, url };
   }
+}
+
+// ── context-ref disk cache + sync fetch (for cld-ts's CJS/no-await world) ─
+// Shares cache dir AND file format with pi-exts/yaml-providers/cache.ts
+// (`_context_ref_<sanitized-url>.json` holding { fetchedAt, catalog }), so a
+// catalog the pi extension already downloaded is reused here and vice versa.
+// The pi-exts wrapper (contextRef.ts getContextRef) is async only for Promise
+// in-flight de-dup - irrelevant to a single-shot CLI, hence this sync variant.
+export const CONTEXT_REF_CACHE_DIR = path.join(homedir(), ".cache", "yaml-providers");
+
+function contextRefCacheFile(cacheDir: string, url: string): string {
+  const key = url.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 120);
+  return path.join(cacheDir, `_context_ref_${key}.json`);
+}
+
+export interface ContextRefCacheEntry {
+  fetchedAt: number;
+  catalog: ContextRefCatalog;
+}
+
+export function readContextRefCache(cacheDir: string, url: string): ContextRefCacheEntry | null {
+  const file = contextRefCacheFile(cacheDir, url);
+  if (!existsSync(file)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    if (typeof parsed?.fetchedAt !== "number" || typeof parsed?.catalog !== "object" || parsed.catalog === null) {
+      return null;
+    }
+    return {
+      fetchedAt: parsed.fetchedAt,
+      catalog: new Map(Object.entries(parsed.catalog as Record<string, ContextRefEntry[]>)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writeContextRefCache(cacheDir: string, url: string, catalog: ContextRefCatalog): void {
+  mkdirSync(cacheDir, { recursive: true });
+  const file = contextRefCacheFile(cacheDir, url);
+  writeFileSync(file, JSON.stringify({ fetchedAt: Date.now(), catalog: Object.fromEntries(catalog) }, null, 2));
+}
+
+export interface GetContextRefSyncOptions {
+  cacheDir?: string;
+  ttlMs?: number;
+  now?: number;
+  force?: boolean;
+  fetchFn?: (url: string) => ContextRefFetchResult;
+}
+
+export interface GetContextRefSyncResult {
+  catalog: ContextRefCatalog;
+  warning?: string;
+}
+
+export function getContextRefSync(url: string, options: GetContextRefSyncOptions = {}): GetContextRefSyncResult {
+  const cacheDir = options.cacheDir ?? CONTEXT_REF_CACHE_DIR;
+  const ttlMs = options.ttlMs ?? 24 * 60 * 60 * 1000;
+  const now = options.now ?? Date.now();
+  const fetchFn = options.fetchFn ?? fetchContextRefCatalog;
+
+  const cached = readContextRefCache(cacheDir, url);
+  if (!options.force && cached && now - cached.fetchedAt < ttlMs) {
+    return { catalog: cached.catalog };
+  }
+
+  const result = fetchFn(url);
+  if (result.ok) {
+    writeContextRefCache(cacheDir, url, result.catalog);
+    return { catalog: result.catalog };
+  }
+
+  if (cached) {
+    return {
+      catalog: cached.catalog,
+      warning: `max_context_ref ${url}: fetch failed (${result.error}), using stale cache from ${new Date(cached.fetchedAt).toISOString()}`,
+    };
+  }
+
+  return {
+    catalog: new Map(),
+    warning: `max_context_ref ${url}: fetch failed (${result.error}), no cache available`,
+  };
+}
+
+// ── Claude Code context-window hand-off ─────────────────────────────────
+// How cld tells the claude child the real window of a gateway/custom model
+// (see https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id):
+//  - window >= 1M: append "[1m]" to the model ID. The suffix is a client-side
+//    selector - claude strips it before serializing the request body and
+//    expresses the opt-in via the `context-1m-2025-08-07` anthropic-beta
+//    header instead, so the gateway sees the bare ID (anthropics/claude-code
+//    #60913, maintainer-verified on v2.1.233).
+//  - window < 1M on an unrecognized custom spelling (doesn't start with
+//    "claude-" and contains no known claude-* model name): export
+//    CLAUDE_CODE_MAX_CONTEXT_TOKENS=<window> at launch; it drives both the
+//    status-line window and the auto-compact threshold (#68522).
+//  - IDs claude resolves to a known model (e.g. "anthropic/claude-sonnet-5",
+//    bare "claude-..." names): no override - claude uses its built-in
+//    catalog, and MAX_CONTEXT_TOKENS would only apply with DISABLE_COMPACT.
+export interface ClaudeContextResolution {
+  modelId: string;
+  maxContextTokens?: number;
+  appended1m: boolean;
+}
+
+const CLAUDE_KNOWN_MODEL_NAME = /claude-(opus|sonnet|haiku|fable)-/i;
+const ONE_M = 1_000_000;
+
+export function resolveClaudeContextWindow(modelId: string, contextWindow: number | undefined): ClaudeContextResolution {
+  const had1m = /(\[1m\])+$/i.test(modelId);
+  const bare = modelId.replace(/(\[1m\])+$/i, "").trim();
+
+  if (contextWindow === undefined) {
+    return { modelId: had1m ? `${bare}[1m]` : bare, appended1m: false };
+  }
+
+  if (contextWindow >= ONE_M) {
+    return { modelId: `${bare}[1m]`, appended1m: !had1m };
+  }
+
+  if (had1m) {
+    // User already tagged the ID for 1M; MAX_CONTEXT_TOKENS doesn't apply to
+    // [1m]-carrying IDs on its own (would need CLAUDE_CODE_DISABLE_1M_CONTEXT).
+    return { modelId: `${bare}[1m]`, appended1m: false };
+  }
+
+  if (CLAUDE_KNOWN_MODEL_NAME.test(bare) || /^claude-/i.test(bare)) {
+    return { modelId: bare, appended1m: false };
+  }
+
+  return { modelId: bare, maxContextTokens: contextWindow, appended1m: false };
 }
 
 // ── synchronous line prompt (no readline dependency - see design doc's

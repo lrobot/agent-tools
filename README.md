@@ -35,6 +35,16 @@ agent-tools/
 Env overrides: `AGENT_PROVIDERS_YAML`, `AGENT_INSTANCES_YAML`
 (read by `resolveProvidersYaml()` / `resolveInstancesYaml()` in `ts-lib/lib.ts`).
 
+## cld context-window detection
+
+`_modelselect` detects each model's real context window (live `/models` listing,
+falling back to the provider's `max_context_ref` catalog) and persists it:
+>=1M windows become a `[1m]` suffix on the model ID in `cld.<instance>.yaml`
+(client-side selector; claude strips it before the wire), sub-1M windows land in
+an optional `context:` section and are exported as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+at launch. Without this, claude assumes 200K for every unrecognized gateway ID and
+auto-compacts there. Full design + wire-capture evidence: `docs/design_cld_context_window.md`.
+
 ## Git subtrees
 
 The three pi extensions are embedded with full upstream history via
