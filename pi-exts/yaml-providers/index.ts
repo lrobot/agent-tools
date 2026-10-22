@@ -1,5 +1,6 @@
 import os from "os";
 import path from "path";
+import { realpathSync } from "fs";
 import {
   isInstanceInProfile,
   loadInstances,
@@ -7,6 +8,10 @@ import {
   loadSecrets,
   resolveInstancesYaml,
   resolveProvidersYaml,
+  compileModelExcludes,
+  isModelExcluded,
+  isExactExcluded,
+  loadExcludeModels,
   type InstanceEntry,
   type ProviderEntry,
 } from "./config";
@@ -23,7 +28,22 @@ import type { LiveModel } from "../../ts-lib/lib";
 // ~/.local/bin/providers.yaml -> <repo>/pi-exts/yaml-providers/providers.yaml
 // created by the setup-providers-link mise task.
 const CACHE_DIR = path.join(os.homedir(), ".cache", "yaml-providers");
-const PROVIDERS_YAML = resolveProvidersYaml();
+// realpathSync: providers.yaml is reached through a per-machine symlink
+// (~/.local/bin/providers.yaml -> <repo>/pi-exts/yaml-providers/providers.yaml);
+// dirname() of the unresolved symlink path would point CONFIG_YAML at
+// ~/.local/bin/config.yaml instead of the repo dir. Falls back to the raw
+// path when the symlink target is missing.
+const PROVIDERS_YAML = (() => {
+  const p = resolveProvidersYaml();
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+})();
+// Global optional exclude list (exclude_models: exact ids), resolved relative
+// to providers.yaml so it lands in the same repo dir on every machine.
+const CONFIG_YAML = path.join(path.dirname(PROVIDERS_YAML), "config.yaml");
 const INSTANCES_YAML = resolveInstancesYaml();
 const SECRETS_YAML = path.join(os.homedir(), ".ssh", "secret.yaml");
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -84,7 +104,7 @@ async function buildProviderConfig(
   inst: InstanceEntry,
   providers: Record<string, ProviderEntry>,
   secrets: Record<string, { secret: string }>,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; globalExcludes?: string[] },
 ): Promise<BuildResult> {
   const provider = providers[inst.provider_name];
   if (!provider) return { warning: `instance ${instanceName}: unknown provider ${inst.provider_name}` };
@@ -102,6 +122,19 @@ async function buildProviderConfig(
     staticIds: provider.models ? Object.values(provider.models) : undefined,
   });
 
+  // Two-layer exclusion, both applied after getModelIds so they cover all
+  // three sources (live fetch, cache, static fallback) uniformly:
+  //   - per-instance pi_models_exclude regexes (instances yaml)
+  //   - global config.yaml exclude_models exact ids (see isExactExcluded)
+  const { regexes: excludes, invalid: invalidExcludes } = compileModelExcludes(inst.pi_models_exclude);
+  const globalExcludes = opts?.globalExcludes ?? [];
+  const excludeWarning = invalidExcludes.length
+    ? `instance ${instanceName}: invalid pi_models_exclude patterns ignored: ${invalidExcludes.join(", ")}`
+    : undefined;
+  const models = r.models.filter(
+    (m) => !isModelExcluded(m.id, excludes) && !isExactExcluded(m.id, globalExcludes),
+  );
+
   // Only fetched when the provider opts in - most providers' /models listing
   // already publishes real limits and never needs this (see design_pi_extension.md).
   let contextRefFor: ((id: string) => ContextRefEntry) | undefined;
@@ -117,7 +150,7 @@ async function buildProviderConfig(
   }
 
   const baseUrl = resolveBaseUrlV1(provider);
-  const registrations = [...groupModelsByApi(toModelConfigs(r.models, contextRefFor))].map(([api, models]) => ({
+  const registrations = [...groupModelsByApi(toModelConfigs(models, contextRefFor))].map(([api, models]) => ({
     id: `dotc-${instanceName}-${api}`,
     config: {
       name: provider.name ?? instanceName,
@@ -130,7 +163,7 @@ async function buildProviderConfig(
   }));
 
   return {
-    warning: [r.warning, contextRefWarning].filter(Boolean).join("; ") || undefined,
+    warning: [r.warning, contextRefWarning, excludeWarning].filter(Boolean).join("; ") || undefined,
     registrations,
   };
 }
@@ -145,12 +178,13 @@ export default async function (pi: any) {
   const providers = loadProviders(PROVIDERS_YAML);
   const instances = loadInstances(INSTANCES_YAML);
   const secrets = loadSecrets(SECRETS_YAML);
+  const globalExcludes = loadExcludeModels(CONFIG_YAML);
   const warnings: string[] = [];
 
   await Promise.all(
     Object.entries(instances).map(async ([name, inst]) => {
       if (!isInstanceInProfile(inst)) return;
-      const result = await buildProviderConfig(name, inst, providers, secrets);
+      const result = await buildProviderConfig(name, inst, providers, secrets, { globalExcludes });
       if (result.warning) warnings.push(result.warning);
       registerResult(pi, result);
     }),
@@ -172,7 +206,10 @@ export default async function (pi: any) {
           ctx.ui.notify(`modelreload: unknown or inactive instance ${name}`, "warning");
           continue;
         }
-        const result = await buildProviderConfig(name, instances[name], providers, secrets, { force: true });
+        const result = await buildProviderConfig(name, instances[name], providers, secrets, {
+          force: true,
+          globalExcludes,
+        });
         if (result.warning) {
           ctx.ui.notify(`modelreload ${name}: ${result.warning}`, "warning");
         }

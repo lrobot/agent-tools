@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { writeFileSync, mkdtempSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
-import { loadProviders, loadInstances, inferApi, isInstanceInProfile } from "./config";
+import { loadProviders, loadInstances, inferApi, isInstanceInProfile, compileModelExcludes, isModelExcluded, loadExcludeModels, isExactExcluded } from "./config";
 
 test("loadProviders parses a providers yaml file", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "pi-ext-"));
@@ -68,4 +68,58 @@ test("isInstanceInProfile handles default, custom, empty and wildcard profiles",
   expect(isInstanceInProfile({ provider_name: "p", secret_key_name: "s", pi_profile: ["work"] }, "default")).toBe(false);
   expect(isInstanceInProfile({ provider_name: "p", secret_key_name: "s", pi_profile: ["work"] }, "work")).toBe(true);
   expect(isInstanceInProfile({ provider_name: "p", secret_key_name: "s", pi_profile: ["*"] }, "custom")).toBe(true);
+});
+
+test("loadInstances parses pi_models_exclude when present", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-ext-"));
+  const file = path.join(dir, "instances.yaml");
+  writeFileSync(
+    file,
+    'globalaijc:\n  pi_models_exclude: ["claude-.*","gemini-.*"]\n  provider_name: globalai\n  secret_key_name: globalaijc\n',
+  );
+  const instances = loadInstances(file);
+  expect(instances.globalaijc.pi_models_exclude).toEqual(["claude-.*", "gemini-.*"]);
+});
+
+test("compileModelExcludes compiles valid patterns and collects invalid ones", () => {
+  const { regexes, invalid } = compileModelExcludes(["claude-.*", "gemini-.*", "[unclosed"]);
+  expect(regexes).toHaveLength(2);
+  expect(invalid).toEqual(["[unclosed"]);
+});
+
+test("compileModelExcludes handles undefined and empty input", () => {
+  expect(compileModelExcludes(undefined)).toEqual({ regexes: [], invalid: [] });
+  expect(compileModelExcludes([])).toEqual({ regexes: [], invalid: [] });
+});
+
+test("isModelExcluded matches regexes against model ids", () => {
+  const { regexes } = compileModelExcludes(["claude-.*", "gemini-.*", "kimi-.*", "glm-.*"]);
+  expect(isModelExcluded("claude-sonnet-4-5", regexes)).toBe(true);
+  expect(isModelExcluded("gemini-3-pro", regexes)).toBe(true);
+  expect(isModelExcluded("glm-4.6", regexes)).toBe(true);
+  expect(isModelExcluded("deepseek-chat", regexes)).toBe(false);
+  expect(isModelExcluded("anything", [])).toBe(false);
+});
+
+test("loadExcludeModels parses exclude_models and tolerates a missing file", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-ext-"));
+  const file = path.join(dir, "config.yaml");
+  writeFileSync(file, "exclude_models:\n  - gpt-5\n  - glm-4.6\n  - 42\n");
+  // non-string entries are dropped, strings kept
+  expect(loadExcludeModels(file)).toEqual(["gpt-5", "glm-4.6"]);
+  expect(loadExcludeModels(path.join(dir, "missing.yaml"))).toEqual([]);
+});
+
+test("isExactExcluded matches exact ids and prefixed variants, not regex", () => {
+  const entries = ["glm-4.6", "anthropic/deepseek/deepseek-v4.1-flash-1017[1m]"];
+  expect(isExactExcluded("glm-4.6", entries)).toBe(true);
+  expect(isExactExcluded("anthropic/deepseek/deepseek-v4.1-flash-1017[1m]", entries)).toBe(true);
+  // id carries an extra prefix (e.g. dotc-registration/model id)
+  expect(isExactExcluded("dotc-x/anthropic/deepseek/deepseek-v4.1-flash-1017[1m]", entries)).toBe(true);
+  // entry carries a prefix the raw id lacks
+  expect(isExactExcluded("deepseek/deepseek-v4.1-flash-1017[1m]", entries)).toBe(true);
+  // exact semantics: no regex, no substring leaks
+  expect(isExactExcluded("glm-5", entries)).toBe(false);
+  expect(isExactExcluded("gpt-5-chat", ["gpt-5"])).toBe(false);
+  expect(isExactExcluded("anything", [])).toBe(false);
 });

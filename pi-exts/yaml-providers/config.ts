@@ -20,6 +20,54 @@ export interface InstanceEntry {
   provider_name: string;
   secret_key_name: string;
   pi_profile?: string[];
+  // Regex patterns matched against model ids; matching models are excluded
+  // from pi's model list at registration time (applies to live fetch, cache
+  // and the static providers.yaml fallback alike, since filtering happens
+  // after getModelIds). Invalid patterns are ignored with a warning.
+  pi_models_exclude?: string[];
+}
+
+export function compileModelExcludes(patterns?: string[]): { regexes: RegExp[]; invalid: string[] } {
+  const regexes: RegExp[] = [];
+  const invalid: string[] = [];
+  for (const pattern of patterns ?? []) {
+    try {
+      regexes.push(new RegExp(pattern));
+    } catch {
+      invalid.push(pattern);
+    }
+  }
+  return { regexes, invalid };
+}
+
+export function isModelExcluded(id: string, regexes: RegExp[]): boolean {
+  return regexes.some((re) => re.test(id));
+}
+
+// config.yaml (optional, lives next to the extension): a global
+// `exclude_models` list of exact model ids (generated from `pi
+// --list-models`) applied to every instance on top of any per-instance
+// pi_models_exclude regexes. Missing file = no excludes (unlike
+// providers.yaml, which must exist).
+export function loadExcludeModels(filePath: string): string[] {
+  try {
+    const parsed: { exclude_models?: unknown } = parse(readFileSync(filePath, "utf8")) ?? {};
+    return Array.isArray(parsed.exclude_models)
+      ? parsed.exclude_models.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+// Exact-match semantics for exclude_models entries. Ids were copied from
+// `pi --list-models`, so some entries carry api/vendor prefixes (e.g.
+// "anthropic/deepseek/deepseek-v4.1-flash-1017[1m]") while others are bare
+// ids: a model matches when id === entry, the id ends with "/"+entry, or
+// the entry ends with "/"+id. Deliberately NOT regex - entries contain
+// regex-significant characters like `[1m]`.
+export function isExactExcluded(id: string, entries: string[]): boolean {
+  return entries.some((entry) => entry === id || id.endsWith(`/${entry}`) || entry.endsWith(`/${id}`));
 }
 
 export function isInstanceInProfile(
