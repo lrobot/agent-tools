@@ -4,5 +4,5 @@ dist/
 .DS_Store
 *.log
 
-# pi-exts/pi-antigravity, pi-exts/pi-multi-account and pi-exts/pi-proxy-router
-# are git subtrees (see `git log` for their upstream history).
+# pi-exts/pi-antigravity, pi-exts/pi-multi-account, pi-exts/pi-proxy-router and
+# pi-exts/pi-usage are git subtrees (see `git log` for their upstream history).

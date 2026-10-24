@@ -20,7 +20,8 @@ agent-tools/
     ├── yaml-providers/   pi extension: yaml-defined providers (plain files, this repo)
     ├── pi-antigravity/   GIT SUBTREE of github.com:Rahularya01/pi-antigravity (main)
     ├── pi-multi-account/ GIT SUBTREE of github.com:Sarrius/pi-multi-account (main)
-    └── pi-proxy-router/  GIT SUBTREE of github.com:leench/pi-proxy-router (master)
+    ├── pi-proxy-router/  GIT SUBTREE of github.com:leench/pi-proxy-router (master)
+    └── pi-usage/         GIT SUBTREE of github.com:mtrojnar/pi-usage (main)
 ```
 
 ## Runtime paths (all via os.homedir(), portable to Windows)
@@ -47,7 +48,7 @@ auto-compacts there. Full design + wire-capture evidence: `docs/design_cld_conte
 
 ## Git subtrees
 
-The three pi extensions are embedded with full upstream history via
+The four pi extensions are embedded with full upstream history via
 `git subtree add` (no `--squash`), so this repo is self-contained AND can
 exchange commits with upstreams:
 
@@ -58,7 +59,10 @@ exchange commits with upstreams:
   (currently: pi-antigravity per-provider proxy patch, pi-multi-account
   custom-family-registry, pi-proxy-router antigravity OAuth endpoints +
   npm-undici-by-path load so ProxyAgent survives Bun's `undici` builtin
-  aliasing — see anti-network-blocking.md in /opt/ops).
+  aliasing — see anti-network-blocking.md in /opt/ops — plus the
+  globalThis `__piProxyRouter` bridge (v1.3.0), pi-usage routing its usage
+  checks through that bridge — both committed in this repo, see
+  docs/design_pi_usage_proxy_router.md in /opt/ops for the design).
   Keep them as separate commits from subtree pulls so both directions stay
   clean.
 
@@ -68,6 +72,7 @@ exchange commits with upstreams:
 git subtree pull --prefix=pi-exts/pi-antigravity pi-antigravity main
 git subtree pull --prefix=pi-exts/pi-multi-account pi-multi-account main
 git subtree pull --prefix=pi-exts/pi-proxy-router pi-proxy-router master
+git subtree pull --prefix=pi-exts/pi-usage pi-usage main
 ```
 
 ### Push local subtree changes upstream (needs a fork + write access)
@@ -103,6 +108,7 @@ mise install          # tools + postinstall-all hook:
 pi install <clone-path>/pi-exts/pi-antigravity
 pi install <clone-path>/pi-exts/pi-multi-account
 pi install <clone-path>/pi-exts/pi-proxy-router
+pi install <clone-path>/pi-exts/pi-usage
 pi install <clone-path>/pi-exts/yaml-providers
 # plus: add "<clone-path>/pi-exts/include-rule.ts" to settings.json "extensions"
 ```
