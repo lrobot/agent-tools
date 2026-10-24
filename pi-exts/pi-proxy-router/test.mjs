@@ -12,7 +12,7 @@
  * Run: node test.mjs
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getGlobalDispatcher, setGlobalDispatcher } from "undici";
@@ -405,6 +405,121 @@ checkRoute(
 const unmatchedBefore = fallbackCalls.length;
 dispatchUrl("https://api.example.test", "/v1/chat/completions");
 check("fallback: endpoint of an unmatched model is not routed", fallbackCalls.length - unmatchedBefore, 1);
+
+// ── 5. extension bridge (globalThis.__piProxyRouter) ──────────────────
+
+const bridge = globalThis.__piProxyRouter;
+checkTrue("bridge: published with version 1", bridge?.version === 1);
+
+// Flatten an error plus its cause chain so proxy-routing evidence
+// ("Unable to connect to <proxy-host>") is visible regardless of how
+// undici/socks wraps it.
+const errorChain = (error) => {
+	const parts = [];
+	let cursor = error;
+	while (cursor && parts.length < 6) {
+		parts.push(`${cursor?.name ?? ""}: ${cursor?.message ?? String(cursor)}`);
+		cursor = cursor?.cause;
+	}
+	return parts.join(" | ");
+};
+// Evidence without real network: build (or invoke) the bridge fetch and
+// return the flattened error chain. ftp:// rules fail with "Unsupported
+// proxy URL" before any socket exists; socks5h://127.0.0.1:1 fails with
+// ECONNREFUSED at the proxy TCP connect — proving the proxy path was taken
+// (a direct fetch would fail with ENOTFOUND on the fictional target host).
+const bridgeFetchError = async (makeFetch, url) => {
+	try {
+		const fetchFn = makeFetch();
+		return await fetchError(fetchFn, url);
+	} catch (error) {
+		return errorChain(error);
+	}
+};
+const fetchError = async (fetchFn, url) => {
+	try {
+		await Promise.race([
+			fetchFn(url, { method: "GET" }),
+			new Promise((_, reject) => setTimeout(() => reject(new Error("bridge fetch timed out")), 8000).unref?.()),
+		]);
+	} catch (error) {
+		return errorChain(error);
+	}
+	return "";
+};
+
+// The main registry is current again after the fallback section.
+sessionStart(registry);
+
+check(
+	"bridge: resolveForOrigin reports the codex rule",
+	bridge.resolveForOrigin("https://chatgpt.com"),
+	{ matched: true, url: PROXY_CODEX },
+);
+check("bridge: resolveForOrigin on full base URL uses its origin", bridge.resolveForOrigin("https://chatgpt.com/backend-api/codex"), { matched: true, url: PROXY_CODEX });
+check("bridge: resolveForOrigin for an unknown origin is undefined", bridge.resolveForOrigin("https://no-such-origin.example.test"), undefined);
+
+const codexBridgeFetch = bridge.fetchForOrigin("https://chatgpt.com/backend-api");
+checkTrue("bridge: unanimous origin returns a fetch", typeof codexBridgeFetch === "function");
+
+check("bridge: origin without a rule returns undefined", bridge.fetchForOrigin("https://api.example.test"), undefined);
+check("bridge: non-HTTP(S) key returns undefined", bridge.fetchForOrigin("socks5://chatgpt.com"), undefined);
+
+checkTrue("bridge: provider with unanimous models returns a fetch", typeof bridge.fetchForProvider("openai-codex") === "function");
+check("bridge: provider without models or auth rule returns undefined", bridge.fetchForProvider("zai"), undefined);
+check("bridge: provider without models falls back to no auth rule (fixture)", bridge.fetchForProvider("openrouter"), undefined);
+
+checkTrue("bridge: explicit direct rule returns a fetch", typeof bridge.fetchForOrigin("https://direct.example.test") === "function");
+check("bridge: direct rule resolves with url null", bridge.resolveForOrigin("https://direct.example.test"), { matched: true, url: null });
+
+// Conflicting provider rules on one origin stay direct (undefined).
+const CONFLICT_A = { provider: "openai-codex", id: "conflict-a", api: "openai-codex-responses", baseUrl: "https://shared.example.test/a" };
+const CONFLICT_B = { provider: "openai", id: "conflict-b", api: "openai-responses", baseUrl: "https://shared.example.test/b" };
+sessionStart(mkRegistry(new Map([["openai-codex", bases.get("openai-codex")], ["openai", bases.get("openai")]]), { chat: [CONFLICT_A, CONFLICT_B], image: [], classifier: [] }));
+check("bridge: conflicting rules on one origin return undefined", bridge.fetchForOrigin("https://shared.example.test"), undefined);
+check("bridge: conflicting origin reports no decision", bridge.resolveForOrigin("https://shared.example.test"), undefined);
+sessionStart(registry);
+
+// Proxy-path evidence, no real network. An ftp:// rule fails at dispatcher
+// construction with "Unsupported proxy URL" before any socket exists;
+// socks5h://127.0.0.1:1 fails at the proxy TCP connect — in both cases a
+// direct fetch would instead fail with ENOTFOUND on the fictional target host.
+sessionStart(mkRegistry(new Map([["unsupported-only", imageOnlyBase]]), { chat: [], image: [unsupportedImage], classifier: [] }));
+let chain = await bridgeFetchError(() => bridge.fetchForOrigin("https://unsupported.example.test"), "https://unsupported.example.test/v1/x");
+checkTrue("bridge: origin fetch leaves through the rule's proxy", chain.includes("Unsupported proxy URL") && chain.includes("ftp://unsupported.example.test"), chain);
+chain = await bridgeFetchError(() => bridge.fetchForProvider("unsupported-only"), "https://unsupported.example.test/v1/x");
+checkTrue("bridge: provider fetch leaves through the rule's proxy", chain.includes("Unsupported proxy URL") && chain.includes("ftp://unsupported.example.test"), chain);
+
+// A socks rule pointing at a closed local port proves the TCP connect went
+// to the proxy (ECONNREFUSED on 127.0.0.1:1) instead of the target host.
+const bridgeConfigPath = join(home, ".pi", "agent", "proxy-router.json");
+const bridgeConfig = JSON.parse(readFileSync(bridgeConfigPath, "utf8"));
+bridgeConfig.models["bridge-socks/*"] = "socks5h://127.0.0.1:1";
+writeFileSync(bridgeConfigPath, JSON.stringify(bridgeConfig, null, 2));
+sessionStart(
+	mkRegistry(
+		new Map([["bridge-socks", bases.get("zai")]]),
+		{ chat: [{ provider: "bridge-socks", id: "bs-1", api: "openai-completions", baseUrl: "https://bridge-socks.example.test/v1" }], image: [], classifier: [] },
+	),
+);
+chain = await bridgeFetchError(() => bridge.fetchForOrigin("https://bridge-socks.example.test"), "https://bridge-socks.example.test/v1/x");
+checkTrue("bridge: socks rule connects to the proxy instead of the target", chain !== "" && !chain.includes("ENOTFOUND"), chain);
+
+// /allproxy covers even origins without any model rule.
+await runCommand("allproxy", "socks5h://127.0.0.1:1", registry);
+checkTrue("bridge: /allproxy routes an otherwise unmatched origin", typeof bridge.fetchForOrigin("https://api.example.test") === "function");
+chain = await bridgeFetchError(() => bridge.fetchForOrigin("https://api.example.test"), "https://api.example.test/v1/usage");
+checkTrue("bridge: /allproxy fetch connects to the session proxy", chain !== "" && !chain.includes("ENOTFOUND"), chain);
+check("bridge: status reports allProxy", bridge.status(), { disabled: false, allProxy: "socks5h://127.0.0.1:1" });
+await runCommand("allproxy", "", registry);
+
+// /noproxy disables bridge routing entirely.
+await runCommand("noproxy", "off", registry);
+check("bridge: /noproxy returns undefined for a ruled origin", bridge.fetchForOrigin("https://chatgpt.com"), undefined);
+checkTrue("bridge: status reports disabled", bridge.status().disabled === true);
+await runCommand("noproxy", "on", registry);
+sessionStart(registry);
+checkTrue("bridge: /noproxy restore returns a fetch again", typeof bridge.fetchForOrigin("https://chatgpt.com") === "function");
 
 console.log(failures.length === 0 ? "\nall checks passed" : `\n${failures.length} check(s) failed:\n- ${failures.join("\n- ")}`);
 process.exitCode = failures.length === 0 ? 0 : 1;

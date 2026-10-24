@@ -43,8 +43,11 @@ import type {
 // 目录/文件路径加载是纯文件操作，Bun 不会拦截。undici v7 是 CJS
 //（无 "type":"module"），require 即可。这样修复只依赖源码和
 // package.json 声明的版本（^7.0.0），node_modules 删了重装功能不丢。
-const undiciDir = dirname(require.resolve("undici/package.json"));
-const undiciMod: typeof import("undici") = require(undiciDir);
+// 用 createRequire 而不是裸 require：pi（Bun）内两者都有，但 node 以
+// ESM 加载本文件时（test.mjs 直接 import）裸 require 不存在。
+const nodeRequire = createRequire(import.meta.url);
+const undiciDir = dirname(nodeRequire.resolve("undici/package.json"));
+const undiciMod: typeof import("undici") = nodeRequire(undiciDir);
 const {
   Agent,
   fetch: undiciFetch,
@@ -54,6 +57,7 @@ const {
 } = undiciMod;
 type Dispatcher = import("undici").Dispatcher;
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { SocksDispatcher } from "./socks-dispatcher.ts";
@@ -543,6 +547,31 @@ function makeBunProxyFetch(proxyUrl: string): NonNullable<StreamOptions["fetch"]
   }) as NonNullable<StreamOptions["fetch"]>;
 }
 
+/** Fetch bound to a route decision's proxy (null = explicit direct connection). */
+export type RoutedFetch = (url: string, init?: RequestInit) => Promise<Response>;
+
+// Under Bun an http(s) proxy goes through the native fetch `proxy` option;
+// everything else (socks5, explicit direct, or Node http proxies) uses npm
+// undici with an explicit dispatcher. See the note above `isBun` for the
+// streaming bug that rules out npm-undici streaming under Bun.
+function makeRoutedFetch(proxyUrl: string | null): RoutedFetch {
+  if (proxyUrl !== null && isBun && /^https?:\/\//i.test(proxyUrl)) {
+    return makeBunProxyFetch(proxyUrl) as unknown as RoutedFetch;
+  }
+  const dispatcher = getRouteDispatcher(proxyUrl);
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    try {
+      return (await undiciFetch(input as never, {
+        ...(init as Record<string, unknown>),
+        dispatcher: dispatcher as never,
+      } as never)) as unknown as Response;
+    } catch (err) {
+      logError("proxyFetch failed:", err);
+      throw err;
+    }
+  }) as RoutedFetch;
+}
+
 // Per-model route decision plus the fetch bound to that route's dispatcher.
 // Undefined means the model has no rule, so callers keep the options as-is.
 function modelFetchRoute(
@@ -552,26 +581,8 @@ function modelFetchRoute(
   const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
   if (!route.matched) return undefined;
 
-  let fetch: NonNullable<StreamOptions["fetch"]>;
-  if (isBun && route.url !== null && /^https?:\/\//i.test(route.url)) {
-    fetch = makeBunProxyFetch(route.url);
-  } else {
-    const dispatcher = getRouteDispatcher(route.url);
-    fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      try {
-        return (await undiciFetch(input as never, {
-          ...(init as Record<string, unknown>),
-          dispatcher: dispatcher as never,
-        } as never)) as unknown as Response;
-      } catch (err) {
-        logError("proxyFetch failed:", err);
-        throw err;
-      }
-    }) as NonNullable<StreamOptions["fetch"]>;
-  }
-
   log(`route: ${model.provider}/${model.id} -> ${displayProxyUrl(route.url)}`);
-  return { fetch, url: route.url };
+  return { fetch: makeRoutedFetch(route.url) as NonNullable<StreamOptions["fetch"]>, url: route.url };
 }
 
 // Deferred fetch/cancel, image generation, and classification take the same
@@ -745,6 +756,97 @@ function ensureWebSocketFallback(): void {
   }
 }
 
+// ── Extension bridge (globalThis.__piProxyRouter) ──────────────────────
+//
+// Extensions that make their own HTTP calls (e.g. pi-usage quota checks)
+// cannot go through the wrapped providers or Pi's fetch pipeline, and under
+// Bun the native fetch ignores the global undici dispatcher installed for
+// auth endpoints. They resolve their provider API origin through this bridge
+// so their requests follow the same rules (models/auth, /allproxy, /noproxy)
+// as model traffic. Callers must treat `undefined` as "no rule applies" and
+// fall back to their default pipeline.
+
+export interface PiProxyRouterBridge {
+  version: 1;
+  /** Routed fetch for an HTTP(S) origin or base URL ("https://chatgpt.com"). */
+  fetchForOrigin(origin: string): RoutedFetch | undefined;
+  /** Routed fetch for a provider id: unanimous model rules, else its auth rule. */
+  fetchForProvider(provider: string): RoutedFetch | undefined;
+  /** Route decision for an origin; undefined when the origin is unknown. */
+  resolveForOrigin(origin: string): { matched: boolean; url: string | null } | undefined;
+  /** Session routing state for diagnostics. */
+  status(): { disabled: boolean; allProxy: string | null };
+}
+
+function originKeyOf(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+// Unanimous decision across a group of models; undefined when the group is
+// empty or its models resolve to conflicting routes (conflicts stay direct).
+function resolveModelsRoute(models: readonly KnownModel[]): RouteDecision | undefined {
+  if (models.length === 0) return undefined;
+  const first = resolveModelRoute(activeNoproxyFlag, models[0].provider, models[0].id);
+  for (const model of models.slice(1)) {
+    const route = resolveModelRoute(activeNoproxyFlag, model.provider, model.id);
+    if (route.matched !== first.matched || route.url !== first.url) return undefined;
+  }
+  return first;
+}
+
+function bridgeFetch(decision: RouteDecision | undefined): RoutedFetch | undefined {
+  if (!decision?.matched) return undefined;
+  return makeRoutedFetch(decision.url);
+}
+
+function publishBridge(): void {
+  const bridge: PiProxyRouterBridge = {
+    version: 1,
+    fetchForOrigin(origin) {
+      if (activeNoproxyFlag || commandDisabled) return undefined;
+      // /allproxy covers every origin, including ones no model uses.
+      if (allProxyUrl) return makeRoutedFetch(allProxyUrl);
+      const key = originKeyOf(origin);
+      if (!key) return undefined;
+      const decision = resolveModelsRoute(
+        knownModels.filter((model) => originKeyOf(model.baseUrl) === key),
+      );
+      if (decision) log(`bridge route: ${key} -> ${displayProxyUrl(decision.url)}`);
+      return bridgeFetch(decision);
+    },
+    fetchForProvider(provider) {
+      if (activeNoproxyFlag || commandDisabled) return undefined;
+      if (allProxyUrl) return makeRoutedFetch(allProxyUrl);
+      const decision = resolveModelsRoute(
+        knownModels.filter((model) => model.provider === provider),
+      );
+      if (decision?.matched) return makeRoutedFetch(decision.url);
+      // Providers without registered models (or without matching model rules)
+      // fall back to their auth rule, which already describes how this
+      // provider's OpenAI/GitHub/... traffic should leave the machine.
+      const rule = loadRules().authRules.find((entry) => entry.provider === provider);
+      return rule ? makeRoutedFetch(rule.url) : undefined;
+    },
+    resolveForOrigin(origin) {
+      const key = originKeyOf(origin);
+      if (!key) return undefined;
+      return resolveModelsRoute(
+        knownModels.filter((model) => originKeyOf(model.baseUrl) === key),
+      );
+    },
+    status() {
+      return { disabled: Boolean(activeNoproxyFlag || commandDisabled), allProxy: allProxyUrl };
+    },
+  };
+  (globalThis as unknown as { __piProxyRouter?: PiProxyRouterBridge }).__piProxyRouter = bridge;
+  log("bridge published on globalThis.__piProxyRouter");
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("noproxy", {
     description: "Disable proxy routing (models and temporary /allproxy requests go direct)",
@@ -863,6 +965,7 @@ export default function (pi: ExtensionAPI) {
 
   ensureGlobalDispatcher(noproxyFlag);
   ensureWebSocketFallback();
+  publishBridge();
   const rules = loadRules();
   log(
     `loaded (${rules.modelRules.length} model rules, ${rules.authRules.length} auth rules ` +

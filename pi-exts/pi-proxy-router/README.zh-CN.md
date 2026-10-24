@@ -143,6 +143,30 @@ pi 启动时全局安装 `EnvHttpProxyAgent`（undici），所有 fetch 默认�
 - 执行 `/allproxy` 后，Pi 的默认 HTTP(S) 链路（包括 OAuth）也走选定的 dispatcher
 - 未命中规则的模型仍走 Pi 默认链路；设置了代理环境变量时它们会走环境变量指定的 HTTP 代理
 
+## 扩展桥接（`globalThis.__piProxyRouter`）
+
+自带 HTTP 请求的扩展（例如 `pi-usage` 的配额检查）既不经过被包装的模型 provider，而在 Bun 下原生 `fetch` 也不理会为 auth endpoint 安装的进程级 undici dispatcher。因此本扩展在 `globalThis.__piProxyRouter` 上发布一个桥接对象，让兄弟扩展按同一套规则路由：
+
+```ts
+interface PiProxyRouterBridge {
+  version: 1;
+  // 按 HTTP(S) origin 或 base URL 返回路由后的 fetch；undefined = 无规则。
+  fetchForOrigin(origin: string): ((url: string, init?: RequestInit) => Promise<Response>) | undefined;
+  // 按 provider id 返回路由后的 fetch：先看模型规则是否一致，再看 auth 规则。
+  fetchForProvider(provider: string): ((url: string, init?: RequestInit) => Promise<Response>) | undefined;
+  // 查询某个 origin 的路由决策；origin 未知时返回 undefined。
+  resolveForOrigin(origin: string): { matched: boolean; url: string | null } | undefined;
+  // 会话路由状态，用于诊断。
+  status(): { disabled: boolean; allProxy: string | null };
+}
+```
+
+语义：
+
+- `fetchForOrigin(origin)`：`/allproxy` 生效时所有 origin 都走会话代理；否则仅当共享该 origin 的全部已知模型解析到同一条规则（全体一致 —— 冲突则保持直连，与 endpoint 兜底行为一致）时才返回 fetch。`direct` 规则返回的 fetch 会绕过环境变量代理。
+- `fetchForProvider(provider)`：该 provider 的模型规则全体一致时用它；否则回退到该 provider 的 `auth` 规则（它描述了该 provider 的 OpenAI/GitHub 流量应如何离开本机）。
+- `/noproxy`（或 `pi --noproxy`）生效或没有规则命中时两者都返回 `undefined`，调用方必须回退到自己的默认链路。调用方还应用 `try/catch` 包裹调用：不支持的代理 URL 会在构造 fetch 时抛错。
+
 ## 已知限制
 
 - endpoint 兜底依赖当前 model registry 提供的 `baseUrl`。由于 URL 无法识别请求对应的模型，扩展只在共享该 endpoint 的所有已知模型路由结果一致时安装兜底；若有模型未命中规则或路由不同，会输出 debug 日志并跳过该 endpoint 兜底。当前 session 的 provider wrapper 仍按模型 ID 应用规则；未经过 wrapper 的请求则回到 Pi 默认链路。需要前台子 agent 也按模型规则代理时，应让共享 endpoint 的模型使用一致规则，或配置不同 endpoint。

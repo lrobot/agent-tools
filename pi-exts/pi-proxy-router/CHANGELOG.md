@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0 - 2026-10-06
+
+### Added
+
+- Extension bridge on `globalThis.__piProxyRouter`: `fetchForOrigin`, `fetchForProvider`, `resolveForOrigin`, and `status`, so sibling extensions (e.g. `pi-usage` quota checks) can route their own HTTP calls through the same `models`/`auth` rules, `/allproxy`, and `/noproxy` state as model traffic. `undefined` means "no rule" and callers fall back to their default pipeline. See README "Extension bridge".
+
+### Fixed
+
+- Extension activation under plain Node ESM: bare `require` crashed with `ReferenceError: require is not defined in ES module scope`; npm undici is now loaded via `createRequire(import.meta.url)` (also fixed `node test.mjs` on a clean checkout).
+
 ## 1.2.4 - 2026-10-06
 
 ### Fixed

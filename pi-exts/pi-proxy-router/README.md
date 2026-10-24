@@ -145,6 +145,30 @@ Pi installs an `EnvHttpProxyAgent` globally at startup, so all fetch calls read 
 - While `/allproxy` is active, Pi's default HTTP(S) pipeline (including OAuth) uses the selected dispatcher
 - Models without a matching rule still use Pi's default pipeline; if proxy environment variables are set, they will go through the HTTP proxy
 
+## Extension bridge (`globalThis.__piProxyRouter`)
+
+Extensions that make their own HTTP calls (for example `pi-usage` quota checks) cannot go through the wrapped model providers, and under Bun the native `fetch` ignores the process-wide undici dispatcher installed for auth endpoints. This extension therefore publishes a bridge on `globalThis.__piProxyRouter` so sibling extensions can route their requests through the same rules:
+
+```ts
+interface PiProxyRouterBridge {
+  version: 1;
+  // Routed fetch for an HTTP(S) origin or base URL; undefined = no rule.
+  fetchForOrigin(origin: string): ((url: string, init?: RequestInit) => Promise<Response>) | undefined;
+  // Routed fetch for a provider id: unanimous model rules, else its auth rule.
+  fetchForProvider(provider: string): ((url: string, init?: RequestInit) => Promise<Response>) | undefined;
+  // Route decision for an origin; undefined when the origin is unknown.
+  resolveForOrigin(origin: string): { matched: boolean; url: string | null } | undefined;
+  // Session routing state for diagnostics.
+  status(): { disabled: boolean; allProxy: string | null };
+}
+```
+
+Semantics:
+
+- `fetchForOrigin(origin)` — when `/allproxy` is active it routes every origin through the session proxy; otherwise it returns a fetch only when all known models sharing that origin resolve to the same rule (unanimous — conflicts stay direct, matching the endpoint-fallback behavior). A `direct` rule returns a fetch that bypasses environment proxies.
+- `fetchForProvider(provider)` — unanimous model rules for that provider, else the provider's `auth` rule (which describes how the provider's OpenAI/GitHub traffic should leave the machine).
+- Both return `undefined` when `/noproxy` (or `pi --noproxy`) is active or no rule matches — callers must then fall back to their default pipeline. Callers should also wrap the call in `try/catch`: an unsupported proxy URL throws at fetch construction.
+
 ## Known limitations
 
 - The endpoint fallback relies on `baseUrl` from the current model registry. Since a URL cannot identify the model for a request, the extension installs a fallback only when all known models sharing that endpoint resolve to the same routing decision. If a model is unrouted or has a different route, it logs a debug message and skips that endpoint fallback. The current session's provider wrapper still applies rules by model ID; requests without that wrapper use Pi's default pipeline. To proxy foreground subagent requests by model, use a consistent rule for models sharing an endpoint or configure separate endpoints.
