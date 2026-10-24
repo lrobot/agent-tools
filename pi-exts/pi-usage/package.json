@@ -1,0 +1,92 @@
+{
+  "name": "@mtrojnar/pi-usage",
+  "version": "0.2.0",
+  "description": "Usage, rate-limit, and spending monitor for pi coding agent: Codex, Claude, Copilot, OpenCode, and OpenRouter daily spend, key budgets, and account credits.",
+  "license": "MIT",
+  "author": "timm-u and Michał Trojnara",
+  "authors": [
+    {
+      "name": "timm-u",
+      "url": "https://github.com/timm-u"
+    },
+    {
+      "name": "Michał Trojnara",
+      "url": "https://github.com/mtrojnar"
+    }
+  ],
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "usage",
+    "rate-limits",
+    "codex",
+    "anthropic",
+    "claude",
+    "copilot",
+    "github-copilot",
+    "opencode",
+    "opencode-go",
+    "opencode-zen",
+    "openrouter",
+    "spending",
+    "credits",
+    "kimi",
+    "zai",
+    "xiaomi",
+    "monitoring"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mtrojnar/pi-usage.git"
+  },
+  "homepage": "https://github.com/mtrojnar/pi-usage",
+  "bugs": {
+    "url": "https://github.com/mtrojnar/pi-usage/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test index.test.ts refresh.test.ts endpoint.test.ts openrouter.test.ts http.test.ts",
+    "prepublishOnly": "npm run check && npm test",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=0.85.0 <1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.0",
+    "@earendil-works/pi-coding-agent": "0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
+    "@types/node": "22.20.1",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2"
+  },
+  "allowScripts": {
+    "@google/genai": false,
+    "esbuild@0.28.2": true,
+    "protobufjs": false
+  }
+}

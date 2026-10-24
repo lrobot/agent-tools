@@ -1,0 +1,2835 @@
+/**
+ * Unit tests for pi-usage core parsing and formatting helpers.
+ * Run with: npm test
+ */
+
+import assert from "node:assert/strict";
+import { afterEach, describe, it, mock } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	clampPercent,
+	formatDuration,
+	formatResetTime,
+	progressBar,
+	quotaWindowIsExpired,
+	statusIcon,
+	truncate,
+	usageColor,
+} from "./src/format.ts";
+import {
+	hasHeaderPrefix,
+	headerValue,
+	parseHeaderBool,
+	parseHeaderNumber,
+	parseOptionalNumber,
+	parseResetAtSeconds,
+	parseRetryAfterSeconds,
+	resetAfterFromAt,
+	retryResetFields,
+} from "./src/headers.ts";
+import {
+	configPathCandidates,
+	dedupe,
+	extractAccountId,
+	getOpenCodeGoQuotaConfig,
+	parseBoolValue,
+	parseEnvBool,
+	parseEnvInt,
+	readJsonObject,
+	resolveConfigValue,
+	validatePrivateConfigFile,
+	widgetSettingFromConfig,
+} from "./src/config.ts";
+import {
+	checkCodexUsageFromUsageApi,
+	parseCodexUsageHeaders,
+	windowMinutes,
+	windowResetAfterSeconds,
+	windowResetAt,
+	windowUsedPercent,
+} from "./src/codex.ts";
+import {
+	cancelResponseBody,
+	fetchSameOrigin,
+	isSameHttpOrigin,
+	readResponseText,
+} from "./src/http.ts";
+import { mergeConcurrentFields, runIsolatedTask } from "./src/concurrent.ts";
+import { readStoredCredential, resolveBoundProviderAuth } from "./src/auth.ts";
+import {
+	buildStartupUsageMessage,
+	buildUsageWidget,
+	codexUsageHasData,
+	codexWindowLabel,
+	footerUsageColor,
+	renderAnthropicWindows,
+	renderCodexWindows,
+	renderCopilotWindows,
+	renderGoWindows,
+	renderSubscriptionWindows,
+	resetDuration,
+	updateFooterStatus,
+	usageHasData,
+} from "./src/render.ts";
+import {
+	checkAnthropicUsage,
+	checkAnthropicUsageFromUsageApi,
+	isAnthropicModelUnavailable,
+	parseAnthropicUsageHeaders,
+} from "./src/anthropic.ts";
+import {
+	getCopilotBaseUrl,
+	isCopilotModelUnavailable,
+	isCopilotQuotaMessage,
+	normalizeCopilotDomain,
+	parseCopilotUsageHeaders,
+} from "./src/copilot.ts";
+import {
+	getOpenCodeGoQuotaHeaderWindows,
+	hasCompleteGoQuotaData,
+	hasOpenCodeGoQuotaHeaders,
+	parseOpenCodeGoDashboardUsage,
+	parseOpenCodeGoUsageHeaders,
+	parseOpenCodeGoUsageWindow,
+	reconcileOpenCodeGoRefresh,
+} from "./src/opencode-go.ts";
+import { resolveProbeEndpoint } from "./src/probe.ts";
+import { parseKimiUsagePayload } from "./src/kimi.ts";
+import {
+	checkSubscriptionProviderUsage,
+	getSubscriptionCheckModels,
+	isSubscriptionModelUnavailable,
+	isSubscriptionQuotaMessage,
+	parseSubscriptionUsageHeaders,
+	type SubscriptionProviderConfig,
+} from "./src/subscription-probe.ts";
+import usageExtension from "./index.ts";
+import type {
+	AnthropicUsage,
+	CodexUsage,
+	CopilotUsage,
+	OpenCodeGoUsage,
+	SubscriptionUsage,
+	UsageContext,
+} from "./src/types.ts";
+
+// ───────── Test Fixtures ─────────
+
+/** Plain formatter used where color output is irrelevant. */
+const identity = (_color: string, text: string): string => text;
+
+/** Complete CodexUsage with quiet defaults; override what a test cares about. */
+function makeCodexUsage(overrides: Partial<CodexUsage> = {}): CodexUsage {
+	return {
+		planType: "unknown",
+		activeLimit: "unknown",
+		rateLimited: false,
+		primaryUsedPercent: 0,
+		secondaryUsedPercent: 0,
+		primaryWindowMinutes: 300,
+		secondaryWindowMinutes: 10080,
+		primaryResetAfterSeconds: 0,
+		secondaryResetAfterSeconds: 0,
+		primaryResetAt: 0,
+		secondaryResetAt: 0,
+		primaryOverSecondaryLimitPercent: 0,
+		creditsHasCredits: false,
+		creditsBalance: "",
+		creditsUnlimited: false,
+		source: "usage_api",
+		...overrides,
+	};
+}
+
+/** Minimal available OpenCodeGoUsage with provider identity filled in. */
+function makeGoUsage(overrides: Partial<OpenCodeGoUsage> = {}): OpenCodeGoUsage {
+	return {
+		provider: "opencode-go",
+		label: "OpenCode Go",
+		shortLabel: "Go",
+		available: true,
+		status: "available",
+		...overrides,
+	};
+}
+
+// ───────── pi auth storage ─────────
+
+describe("readStoredCredential", () => {
+	it("reads an OAuth credential through pi's public one-off API", async () => {
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-usage-auth-"));
+		const credential = {
+			type: "oauth" as const,
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+			accountId: "account-id",
+		};
+		try {
+			process.env.PI_CODING_AGENT_DIR = tempDir;
+			fs.writeFileSync(path.join(tempDir, "auth.json"), JSON.stringify({ "openai-codex": credential }));
+			assert.deepEqual(await readStoredCredential("openai-codex"), credential);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ───────── Refresh orchestration ─────────
+
+describe("usage refresh orchestration", () => {
+	it("renders a completed provider while another provider's auth times out", async () => {
+		mock.timers.enable({ apis: ["setTimeout"] });
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousFetch = globalThis.fetch;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-usage-refresh-"));
+		let commandHandler: ((args: string, ctx: UsageContext) => Promise<void>) | undefined;
+		const widgets: string[][] = [];
+		const notifications: string[] = [];
+		const zaiBaseUrl = "https://api.z.ai/v1";
+
+		try {
+			process.env.PI_CODING_AGENT_DIR = tempDir;
+			globalThis.fetch = mock.fn(async () => new Response(null, { status: 200 }));
+
+			const pi = {
+				registerFlag: () => {},
+				getFlag: (name: string) => name === "usage-widget",
+				on: () => {},
+				registerCommand: (name: string, command: { handler: typeof commandHandler }) => {
+					if (name === "usage") commandHandler = command.handler;
+				},
+			};
+			usageExtension(pi as any);
+			assert.ok(commandHandler);
+
+			const ctx = {
+				hasUI: true,
+				cwd: tempDir,
+				ui: {
+					theme: {
+						fg: (_color: string, text: string) => text,
+						bold: (text: string) => text,
+					},
+					setWidget: (_id: string, lines: string[] | undefined) => {
+						if (lines) widgets.push(lines);
+					},
+					setStatus: () => {},
+					notify: (message: string) => { notifications.push(message); },
+				},
+				modelRegistry: {
+					getProviderAuth: (provider: string) => {
+						if (provider === "kimi-coding") return new Promise(() => {});
+						if (provider === "zai") {
+							return Promise.resolve({ auth: { apiKey: "zai-key", baseUrl: zaiBaseUrl }, source: "test" });
+						}
+						return Promise.resolve(undefined);
+					},
+					getProvider: (provider: string) => provider === "zai"
+						? {
+							baseUrl: zaiBaseUrl,
+							getModels: () => [{
+								id: "glm-test",
+								api: "openai-completions",
+								baseUrl: zaiBaseUrl,
+								cost: { input: 1, output: 1 },
+							}],
+						}
+						: undefined,
+				},
+				isProjectTrusted: () => false,
+			} as any as UsageContext;
+
+			const refresh = commandHandler("", ctx);
+			for (let i = 0; i < 20; i += 1) await Promise.resolve();
+
+			const partialWidget = widgets.at(-1)?.join("\n") ?? "";
+			assert.match(partialWidget, /Z\.AI/);
+			assert.match(partialWidget, /Checking usage limits/);
+
+			mock.timers.tick(30_000);
+			await refresh;
+
+			const finalWidget = widgets.at(-1)?.join("\n") ?? "";
+			assert.match(finalWidget, /Z\.AI/);
+			assert.doesNotMatch(finalWidget, /Checking usage limits/);
+			assert.ok(notifications.includes("Some usage checks timed out"));
+		} finally {
+			mock.timers.reset();
+			globalThis.fetch = previousFetch;
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ───────── Provider task isolation ─────────
+
+describe("runIsolatedTask", () => {
+	it("lets a fast provider complete when a peer times out", async () => {
+		let slowAborted = false;
+		const slow = runIsolatedTask(async (signal) => {
+			signal.addEventListener("abort", () => { slowAborted = true; }, { once: true });
+			return new Promise<string>(() => {});
+		}, 10);
+		const fast = runIsolatedTask(async () => "available", 100);
+
+		const [slowResult, fastResult] = await Promise.all([slow, fast]);
+		assert.deepEqual(slowResult, { status: "timed_out" });
+		assert.deepEqual(fastResult, { status: "fulfilled", value: "available" });
+		assert.equal(slowAborted, true);
+	});
+
+	it("distinguishes parent cancellation from a provider timeout", async () => {
+		const parent = new AbortController();
+		parent.abort();
+		let started = false;
+		const result = await runIsolatedTask(async () => {
+			started = true;
+			return "unused";
+		}, 100, parent.signal);
+
+		assert.deepEqual(result, { status: "aborted" });
+		assert.equal(started, false);
+	});
+
+	it("captures provider rejection without rejecting the coordinator", async () => {
+		const error = new Error("provider failed");
+		const result = await runIsolatedTask(async () => { throw error; }, 100);
+		assert.deepEqual(result, { status: "rejected", reason: error });
+	});
+});
+
+// ───────── mergeConcurrentFields ─────────
+
+describe("mergeConcurrentFields", () => {
+	interface Usage {
+		status: string;
+		quota?: number;
+		error?: string;
+	}
+
+	it("merges refreshed fields without overwriting a newer passive status", () => {
+		const before: Usage = { status: "available", quota: 10 };
+		const current: Usage = { status: "rate_limited", quota: 10 };
+		const result: Usage = { status: "available", quota: 20, error: "stale error" };
+
+		assert.deepEqual(mergeConcurrentFields(result, before, current, ["quota"]), {
+			status: "rate_limited",
+			quota: 20,
+		});
+	});
+
+	it("preserves a field changed by the passive update", () => {
+		const before: Usage = { status: "available", quota: 10 };
+		const current: Usage = { status: "available", quota: 25 };
+		const result: Usage = { status: "available", quota: 20 };
+
+		assert.equal(mergeConcurrentFields(result, before, current, ["quota"]).quota, 25);
+	});
+
+	it("fills fields missing from the first passive update", () => {
+		const current: Usage = { status: "available" };
+		const result: Usage = { status: "available", quota: 20 };
+
+		assert.deepEqual(mergeConcurrentFields(result, undefined, current, ["quota"]), {
+			status: "available",
+			quota: 20,
+		});
+	});
+
+	it("clears an unchanged field omitted by the refreshed result", () => {
+		const before: Usage = { status: "available", error: "stale quota error" };
+		const current: Usage = { status: "rate_limited", error: "stale quota error" };
+		const result: Usage = { status: "available" };
+
+		assert.equal(mergeConcurrentFields(result, before, current, ["error"]).error, undefined);
+	});
+
+	it("keeps the newer passive value when the refreshed result is not authoritative", () => {
+		const before: Usage = { status: "available", quota: 10 };
+		const current: Usage = { status: "rate_limited", quota: 10 };
+		const result: Usage = { status: "error", quota: 0, error: "check failed" };
+
+		assert.equal(mergeConcurrentFields(result, before, current, ["quota"], false), current);
+	});
+});
+
+// ───────── parseEnvInt ─────────
+
+describe("parseEnvInt", () => {
+	it("returns fallback when env var is missing", () => {
+		assert.equal(parseEnvInt("MISSING_VAR_X12345", 30), 30);
+	});
+
+	it("returns parsed positive integer", () => {
+		process.env.TEST_PARSE_INT = "42";
+		assert.equal(parseEnvInt("TEST_PARSE_INT", 10), 42);
+		delete process.env.TEST_PARSE_INT;
+	});
+
+	it("returns fallback for zero", () => {
+		process.env.TEST_PARSE_INT = "0";
+		assert.equal(parseEnvInt("TEST_PARSE_INT", 30), 30);
+		delete process.env.TEST_PARSE_INT;
+	});
+
+	it("returns fallback for negative", () => {
+		process.env.TEST_PARSE_INT = "-5";
+		assert.equal(parseEnvInt("TEST_PARSE_INT", 30), 30);
+		delete process.env.TEST_PARSE_INT;
+	});
+
+	it("returns fallback for NaN", () => {
+		process.env.TEST_PARSE_INT = "abc";
+		assert.equal(parseEnvInt("TEST_PARSE_INT", 30), 30);
+		delete process.env.TEST_PARSE_INT;
+	});
+});
+
+// ───────── parseEnvBool ─────────
+
+describe("parseEnvBool", () => {
+	afterEach(() => {
+		delete process.env.TEST_PARSE_BOOL;
+	});
+
+	it("returns fallback when env var is missing", () => {
+		assert.equal(parseEnvBool("TEST_PARSE_BOOL", true), true);
+		assert.equal(parseEnvBool("TEST_PARSE_BOOL", false), false);
+	});
+
+	it("returns parsed boolean", () => {
+		process.env.TEST_PARSE_BOOL = "false";
+		assert.equal(parseEnvBool("TEST_PARSE_BOOL", true), false);
+		process.env.TEST_PARSE_BOOL = "yes";
+		assert.equal(parseEnvBool("TEST_PARSE_BOOL", false), true);
+	});
+
+	it("returns fallback for unrecognized value", () => {
+		process.env.TEST_PARSE_BOOL = "maybe";
+		assert.equal(parseEnvBool("TEST_PARSE_BOOL", true), true);
+	});
+});
+
+// ───────── parseBoolValue ─────────
+
+describe("parseBoolValue", () => {
+	it("returns undefined for undefined", () => {
+		assert.equal(parseBoolValue(undefined), undefined);
+	});
+
+	it("parses truthy values", () => {
+		assert.equal(parseBoolValue("1"), true);
+		assert.equal(parseBoolValue("true"), true);
+		assert.equal(parseBoolValue("yes"), true);
+		assert.equal(parseBoolValue("on"), true);
+	});
+
+	it("parses falsy values", () => {
+		assert.equal(parseBoolValue("0"), false);
+		assert.equal(parseBoolValue("false"), false);
+		assert.equal(parseBoolValue("no"), false);
+		assert.equal(parseBoolValue("off"), false);
+	});
+
+	it("handles case-insensitive", () => {
+		assert.equal(parseBoolValue("TRUE"), true);
+		assert.equal(parseBoolValue("YeS"), true);
+		assert.equal(parseBoolValue("FALSE"), false);
+	});
+
+	it("handles whitespace", () => {
+		assert.equal(parseBoolValue(" true "), true);
+		assert.equal(parseBoolValue("false "), false);
+	});
+
+	it("returns undefined for unrecognized", () => {
+		assert.equal(parseBoolValue("maybe"), undefined);
+		assert.equal(parseBoolValue(""), undefined);
+	});
+});
+
+// ───────── truncate ─────────
+
+describe("truncate", () => {
+	it("returns text unchanged when within limit", () => {
+		assert.equal(truncate("hello", 10), "hello");
+	});
+
+	it("truncates with ellipsis when over limit", () => {
+		assert.equal(truncate("hello world", 5), "hello…");
+	});
+
+	it("handles empty string", () => {
+		assert.equal(truncate("", 5), "");
+	});
+
+	it("handles exact length", () => {
+		assert.equal(truncate("hello", 5), "hello");
+	});
+});
+
+// ───────── formatDuration ─────────
+
+describe("formatDuration", () => {
+	it("returns 'now' for <= 0", () => {
+		assert.equal(formatDuration(0), "now");
+		assert.equal(formatDuration(-1), "now");
+	});
+
+	it("returns seconds for < 60", () => {
+		assert.equal(formatDuration(30), "30s");
+		assert.equal(formatDuration(1), "1s");
+		assert.equal(formatDuration(59), "59s");
+	});
+
+	it("returns minutes for < 3600", () => {
+		assert.equal(formatDuration(60), "1m");
+		assert.equal(formatDuration(300), "5m");
+		assert.equal(formatDuration(3599), "60m");
+	});
+
+	it("returns hours for < 86400", () => {
+		assert.equal(formatDuration(3600), "1h");
+		assert.equal(formatDuration(5400), "1.5h");
+		assert.equal(formatDuration(86399), "24h");
+	});
+
+	it("returns days for >= 86400", () => {
+		assert.equal(formatDuration(86400), "1d");
+		assert.equal(formatDuration(432000), "5d");
+		assert.equal(formatDuration(864000), "10d");
+	});
+});
+
+describe("quotaWindowIsExpired", () => {
+	it("expires exactly at the reset boundary, not a rounded second early", () => {
+		const window = { resetAt: 1_800_000_001 };
+		mock.timers.enable({ apis: ["Date"], now: window.resetAt * 1000 - 1 });
+		try {
+			assert.equal(quotaWindowIsExpired(window), false);
+			mock.timers.tick(1);
+			assert.equal(quotaWindowIsExpired(window), true);
+			mock.timers.tick(1);
+			assert.equal(quotaWindowIsExpired(window), true);
+		} finally {
+			mock.timers.reset();
+		}
+	});
+
+	it("ignores absent or nonpositive reset times", () => {
+		assert.equal(quotaWindowIsExpired(), false);
+		assert.equal(quotaWindowIsExpired({}), false);
+		assert.equal(quotaWindowIsExpired({ resetAt: 0 }), false);
+		assert.equal(quotaWindowIsExpired({ resetAt: -1 }), false);
+	});
+});
+
+// ───────── progressBar ─────────
+
+describe("progressBar", () => {
+	it("returns empty bar for 0%", () => {
+		assert.equal(progressBar(0), "░".repeat(20));
+	});
+
+	it("returns full bar for 100%", () => {
+		assert.equal(progressBar(100), "█".repeat(20));
+	});
+
+	it("returns full bar for >100%", () => {
+		assert.equal(progressBar(150), "█".repeat(20));
+	});
+
+	it("clamps negative to 0%", () => {
+		assert.equal(progressBar(-10), "░".repeat(20));
+	});
+
+	it("uses custom width", () => {
+		assert.equal(progressBar(50, 10), "█████░░░░░");
+	});
+
+	it("returns correct proportion", () => {
+		assert.equal(progressBar(25, 20), "█████░░░░░░░░░░░░░░░");
+		assert.equal(progressBar(75, 20), "███████████████░░░░░");
+	});
+});
+
+// ───────── parseHeaderNumber ─────────
+
+describe("parseHeaderNumber", () => {
+	it("returns fallback for undefined", () => {
+		assert.equal(parseHeaderNumber(undefined, 42), 42);
+	});
+
+	it("returns fallback for empty string", () => {
+		assert.equal(parseHeaderNumber("", 42), 42);
+	});
+
+	it("parses valid number string", () => {
+		assert.equal(parseHeaderNumber("123", 42), 123);
+	});
+
+	it("returns fallback for NaN", () => {
+		assert.equal(parseHeaderNumber("abc", 42), 42);
+	});
+
+	it("parses zero", () => {
+		assert.equal(parseHeaderNumber("0", 42), 0);
+	});
+
+	it("parses float", () => {
+		assert.equal(parseHeaderNumber("3.14", 0), 3.14);
+	});
+});
+
+// ───────── parseHeaderBool ─────────
+
+describe("parseHeaderBool", () => {
+	it("returns false for undefined", () => {
+		assert.equal(parseHeaderBool(undefined), false);
+	});
+
+	it("returns true for 'true'", () => {
+		assert.equal(parseHeaderBool("true"), true);
+	});
+
+	it("handles case-insensitive", () => {
+		assert.equal(parseHeaderBool("True"), true);
+		assert.equal(parseHeaderBool("TRUE"), true);
+	});
+
+	it("returns false for 'false'", () => {
+		assert.equal(parseHeaderBool("false"), false);
+	});
+
+	it("returns false for other values", () => {
+		assert.equal(parseHeaderBool("yes"), false);
+		assert.equal(parseHeaderBool("1"), false);
+	});
+});
+
+// ───────── headerValue / hasHeaderPrefix ─────────
+
+describe("headerValue", () => {
+	it("looks up header names case-insensitively", () => {
+		assert.equal(headerValue({ "X-Test": "1" }, "x-test"), "1");
+		assert.equal(headerValue({ "x-test": "1" }, "X-TEST"), "1");
+	});
+
+	it("returns undefined when missing", () => {
+		assert.equal(headerValue({ "x-other": "1" }, "x-test"), undefined);
+	});
+});
+
+describe("hasHeaderPrefix", () => {
+	it("matches header prefixes case-insensitively", () => {
+		assert.equal(hasHeaderPrefix({ "X-Codex-Plan": "plus" }, "x-codex-"), true);
+	});
+
+	it("returns false without a match", () => {
+		assert.equal(hasHeaderPrefix({ server: "test" }, "x-codex-"), false);
+	});
+});
+
+// ───────── parseOptionalNumber ─────────
+
+describe("parseOptionalNumber", () => {
+	it("returns the first finite number among named headers", () => {
+		assert.equal(parseOptionalNumber({ "x-b": "7" }, "x-a", "x-b"), 7);
+	});
+
+	it("skips empty and non-numeric values", () => {
+		assert.equal(parseOptionalNumber({ "x-a": "", "x-b": "abc", "x-c": "3" }, "x-a", "x-b", "x-c"), 3);
+	});
+
+	it("returns undefined when nothing parses", () => {
+		assert.equal(parseOptionalNumber({ "x-a": "abc" }, "x-a"), undefined);
+	});
+});
+
+// ───────── parseRetryAfterSeconds ─────────
+
+describe("parseRetryAfterSeconds", () => {
+	it("parses delay seconds", () => {
+		assert.equal(parseRetryAfterSeconds("30"), 30);
+	});
+
+	it("parses HTTP dates into seconds from now", () => {
+		const result = parseRetryAfterSeconds(new Date(Date.now() + 60_000).toUTCString());
+		assert.ok(result >= 58 && result <= 62);
+	});
+
+	it("returns 0 for missing or invalid values", () => {
+		assert.equal(parseRetryAfterSeconds(undefined), 0);
+		assert.equal(parseRetryAfterSeconds("soon"), 0);
+	});
+
+	it("clamps negative delays to 0", () => {
+		assert.equal(parseRetryAfterSeconds("-5"), 0);
+	});
+});
+
+// ───────── parseResetAtSeconds ─────────
+
+describe("parseResetAtSeconds", () => {
+	it("parses unix seconds", () => {
+		assert.equal(parseResetAtSeconds("2000000000"), 2000000000);
+	});
+
+	it("parses unix milliseconds", () => {
+		assert.equal(parseResetAtSeconds("2000000000000"), 2000000000);
+	});
+
+	it("parses date strings", () => {
+		assert.equal(parseResetAtSeconds("2030-01-01T00:00:00.000Z"), 1893456000);
+	});
+
+	it("returns zero for missing or invalid values", () => {
+		assert.equal(parseResetAtSeconds(undefined), 0);
+		assert.equal(parseResetAtSeconds("not-a-date"), 0);
+	});
+});
+
+// ───────── resetAfterFromAt ─────────
+
+describe("resetAfterFromAt", () => {
+	it("returns seconds until a future timestamp", () => {
+		const result = resetAfterFromAt(Math.round(Date.now() / 1000) + 120);
+		assert.ok(result! >= 118 && result! <= 122);
+	});
+
+	it("clamps past timestamps to 0", () => {
+		assert.equal(resetAfterFromAt(Math.round(Date.now() / 1000) - 60), 0);
+	});
+
+	it("returns undefined when unknown", () => {
+		assert.equal(resetAfterFromAt(undefined), undefined);
+		assert.equal(resetAfterFromAt(0), undefined);
+	});
+});
+
+// ───────── retryResetFields ─────────
+
+describe("retryResetFields", () => {
+	it("clears retry fields when not limited", () => {
+		assert.deepEqual(retryResetFields(false, 30, { retryAfterSeconds: 10, retryResetAt: 123 }), {
+			retryAfterSeconds: undefined,
+			retryResetAt: undefined,
+		});
+	});
+
+	it("computes retryResetAt from a fresh Retry-After", () => {
+		const before = Math.round(Date.now() / 1000);
+		const result = retryResetFields(true, 30);
+		assert.equal(result.retryAfterSeconds, 30);
+		assert.ok(result.retryResetAt! >= before + 30);
+	});
+
+	it("preserves previous values without a fresh Retry-After", () => {
+		assert.deepEqual(retryResetFields(true, 0, { retryAfterSeconds: 15, retryResetAt: 456 }), {
+			retryAfterSeconds: 15,
+			retryResetAt: 456,
+		});
+	});
+});
+
+// ───────── clampPercent ─────────
+
+describe("clampPercent", () => {
+	it("returns 0 for negative", () => {
+		assert.equal(clampPercent(-5), 0);
+	});
+
+	it("returns 100 for over max", () => {
+		assert.equal(clampPercent(150), 100);
+	});
+
+	it("returns value in range", () => {
+		assert.equal(clampPercent(50), 50);
+		assert.equal(clampPercent(0), 0);
+		assert.equal(clampPercent(100), 100);
+	});
+
+	it("returns 0 for non-finite values", () => {
+		assert.equal(clampPercent(NaN), 0);
+		assert.equal(clampPercent(Infinity), 0);
+		assert.equal(clampPercent(-Infinity), 0);
+	});
+});
+
+// ───────── dedupe ─────────
+
+describe("dedupe", () => {
+	it("removes duplicates while preserving order", () => {
+		assert.deepEqual(dedupe(["a", "b", "a", "c", "b"]), ["a", "b", "c"]);
+	});
+
+	it("filters empty strings", () => {
+		assert.deepEqual(dedupe(["a", "", "b", ""]), ["a", "b"]);
+	});
+
+	it("returns empty for empty input", () => {
+		assert.deepEqual(dedupe([]), []);
+	});
+
+	it("handles no duplicates", () => {
+		assert.deepEqual(dedupe(["a", "b", "c"]), ["a", "b", "c"]);
+	});
+});
+
+// ───────── usageColor ─────────
+
+describe("usageColor", () => {
+	it("returns success for < 70%", () => {
+		assert.equal(usageColor(0), "success");
+		assert.equal(usageColor(50), "success");
+		assert.equal(usageColor(69), "success");
+	});
+
+	it("returns warning for 70-89%", () => {
+		assert.equal(usageColor(70), "warning");
+		assert.equal(usageColor(80), "warning");
+		assert.equal(usageColor(89), "warning");
+	});
+
+	it("returns error for >= 90%", () => {
+		assert.equal(usageColor(90), "error");
+		assert.equal(usageColor(100), "error");
+		assert.equal(usageColor(200), "error");
+	});
+});
+
+// ───────── footerUsageColor ─────────
+
+describe("footerUsageColor", () => {
+	it("returns dim for 0-50%", () => {
+		assert.equal(footerUsageColor(0), "dim");
+		assert.equal(footerUsageColor(25), "dim");
+		assert.equal(footerUsageColor(50), "dim");
+	});
+
+	it("returns accent for 51-80%", () => {
+		assert.equal(footerUsageColor(51), "accent");
+		assert.equal(footerUsageColor(65), "accent");
+		assert.equal(footerUsageColor(80), "accent");
+	});
+
+	it("returns warning for 81-99%", () => {
+		assert.equal(footerUsageColor(81), "warning");
+		assert.equal(footerUsageColor(90), "warning");
+		assert.equal(footerUsageColor(99), "warning");
+	});
+
+	it("returns error for 100%", () => {
+		assert.equal(footerUsageColor(100), "error");
+	});
+});
+
+// ───────── resetDuration ─────────
+
+describe("resetDuration", () => {
+	it("returns formatted reset time from resetAt", () => {
+		// Use a timestamp far enough ahead that sub-second drift won't matter
+		const future = Math.floor(Date.now() / 1000) + 9000;
+		assert.equal(resetDuration(future, undefined), "2.5h");
+	});
+
+	it("returns formatted duration from resetAfterSeconds", () => {
+		assert.equal(resetDuration(undefined, 60), "1m");
+		assert.equal(resetDuration(undefined, 3600), "1h");
+	});
+
+	it("returns undefined with no args", () => {
+		assert.equal(resetDuration(undefined, undefined), undefined);
+	});
+
+	it("prefers resetAt over resetAfterSeconds", () => {
+		const future = Math.floor(Date.now() / 1000) + 12600;
+		assert.equal(resetDuration(future, 60), "3.5h");
+	});
+
+	it("returns undefined for resetAt=0", () => {
+		assert.equal(resetDuration(0, undefined), undefined);
+	});
+});
+
+// ───────── resolveProbeEndpoint ─────────
+
+describe("resolveProbeEndpoint", () => {
+	it("appends Anthropic /v1/messages", () => {
+		assert.equal(
+			resolveProbeEndpoint("https://api.example.com/root", "anthropic-messages"),
+			"https://api.example.com/root/v1/messages",
+		);
+	});
+
+	it("appends OpenAI chat completions without injecting v1 into nested base paths", () => {
+		assert.equal(
+			resolveProbeEndpoint("https://api.z.ai/api/coding/paas/v4", "openai-completions"),
+			"https://api.z.ai/api/coding/paas/v4/chat/completions",
+		);
+	});
+
+	it("appends OpenAI responses endpoint", () => {
+		assert.equal(
+			resolveProbeEndpoint("https://opencode.ai/zen/v1", "openai-responses"),
+			"https://opencode.ai/zen/v1/responses",
+		);
+	});
+
+	it("keeps an endpoint that already has the API suffix", () => {
+		assert.equal(
+			resolveProbeEndpoint("https://api.example.com/messages", "anthropic-messages"),
+			"https://api.example.com/messages",
+		);
+		assert.equal(
+			resolveProbeEndpoint("https://api.example.com/chat/completions", "openai-completions"),
+			"https://api.example.com/chat/completions",
+		);
+	});
+
+	it("normalizes trailing slashes", () => {
+		assert.equal(
+			resolveProbeEndpoint("https://opencode.ai/zen/v1/", "openai-completions"),
+			"https://opencode.ai/zen/v1/chat/completions",
+		);
+	});
+});
+
+// ───────── Credential origin enforcement ─────────
+
+describe("credential origin enforcement", () => {
+	const realFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = realFetch; });
+
+	it("compares normalized HTTP origins", () => {
+		assert.equal(isSameHttpOrigin("https://api.example.com/v1", "https://API.example.com:443/root"), true);
+		assert.equal(isSameHttpOrigin("https://api.example.com", "http://api.example.com"), false);
+		assert.equal(isSameHttpOrigin("data:text/plain,test", "data:text/plain,other"), false);
+	});
+
+	it("rejects a cross-origin credentialed request before fetch", async () => {
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response();
+		}) as typeof fetch;
+
+		await assert.rejects(
+			fetchSameOrigin("https://unrelated.example/v1/messages", "https://proxy.example/api", {
+				headers: { "x-api-key": "secret" },
+			}),
+			/Refusing credentialed request/,
+		);
+		assert.equal(called, false);
+	});
+
+	it("forces redirect rejection on an allowed request", async () => {
+		let requestInit: RequestInit | undefined;
+		globalThis.fetch = (async (_url, init) => {
+			requestInit = init;
+			return new Response();
+		}) as typeof fetch;
+
+		await fetchSameOrigin("https://proxy.example/v1/messages", "https://proxy.example/api", {
+			redirect: "follow",
+			headers: { "x-api-key": "secret" },
+		});
+		assert.equal(requestInit?.redirect, "error");
+	});
+
+	it("binds a resolved key to the provider's effective base URL", async () => {
+		const ctx = {
+			modelRegistry: {
+				getProviderAuth: async () => ({ auth: { apiKey: "proxy-key" }, source: "test" }),
+				getProvider: () => ({ baseUrl: "https://proxy.example/anthropic", getModels: () => [] }),
+			},
+		} as unknown as Pick<UsageContext, "modelRegistry">;
+
+		assert.deepEqual(await resolveBoundProviderAuth(ctx, "anthropic"), {
+			apiKey: "proxy-key",
+			baseUrl: "https://proxy.example/anthropic",
+			source: "test",
+		});
+	});
+
+	it("does not bind a provider key when catalog models span origins without a provider base URL", async () => {
+		const ctx = {
+			modelRegistry: {
+				getProviderAuth: async () => ({ auth: { apiKey: "ambiguous-key" } }),
+				getProvider: () => ({
+					getModels: () => [
+						{ baseUrl: "https://one.example/v1" },
+						{ baseUrl: "https://two.example/v1" },
+					],
+				}),
+			},
+		} as unknown as Pick<UsageContext, "modelRegistry">;
+
+		assert.equal(await resolveBoundProviderAuth(ctx, "custom"), undefined);
+	});
+
+	it("probes a custom Anthropic proxy without sending its key to official or selected foreign origins", async () => {
+		const requests: Array<{ url: string; init?: RequestInit }> = [];
+		globalThis.fetch = (async (url, init) => {
+			requests.push({ url: String(url), init });
+			return new Response(null, { status: 200 });
+		}) as typeof fetch;
+		const ctx = {
+			modelRegistry: {
+				getProvider: () => ({
+					getModels: () => [{
+						id: "foreign-model",
+						api: "anthropic-messages",
+						baseUrl: "https://unrelated.example",
+						cost: {},
+					}],
+				}),
+			},
+		} as unknown as Pick<UsageContext, "modelRegistry">;
+
+		const usage = await checkAnthropicUsage(ctx, {
+			token: "proxy-key",
+			type: "api_key",
+			source: "test",
+			baseUrl: "https://proxy.example/anthropic",
+		}, undefined, {
+			provider: "anthropic",
+			id: "foreign-model",
+			api: "anthropic-messages",
+			baseUrl: "https://unrelated.example",
+		});
+
+		assert.equal(usage.status, "available");
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0].url, "https://proxy.example/anthropic/v1/messages");
+		assert.equal((requests[0].init?.headers as Record<string, string>)["x-api-key"], "proxy-key");
+		assert.equal(requests[0].init?.redirect, "error");
+	});
+});
+
+// ───────── resolveConfigValue ─────────
+
+describe("resolveConfigValue", () => {
+	it("returns env var value when set", () => {
+		process.env.TEST_RESOLVE = "env-value";
+		assert.equal(resolveConfigValue("TEST_RESOLVE"), "env-value");
+		delete process.env.TEST_RESOLVE;
+	});
+
+	it("returns literal string when env var not set", () => {
+		assert.equal(resolveConfigValue("literal-key"), "literal-key");
+	});
+
+	it("returns empty string when env var is empty", () => {
+		process.env.TEST_RESOLVE = "";
+		assert.equal(resolveConfigValue("TEST_RESOLVE"), "");
+		delete process.env.TEST_RESOLVE;
+	});
+});
+
+// ───────── passive header parsing ─────────
+
+describe("passive parser contract", () => {
+	const providers = [
+		{ name: "Codex", parse: (headers: Record<string, string>, status: number) => parseCodexUsageHeaders(headers, status), header: "x-codex-primary-used-percent", bareRecovery: false },
+		{ name: "Anthropic", parse: parseAnthropicUsageHeaders, header: "anthropic-ratelimit-unified-5h-utilization", bareRecovery: true },
+		{ name: "Copilot", parse: parseCopilotUsageHeaders, header: "x-ratelimit-remaining", bareRecovery: true },
+		{ name: "Go", parse: parseOpenCodeGoUsageHeaders, header: "x-opencode-go-rolling-used-percent", bareRecovery: true },
+		{ name: "subscription", parse: (headers: Record<string, string>, status: number, modelId?: string) => parseSubscriptionUsageHeaders({ provider: "demo", label: "Demo", shortLabel: "Demo" }, headers, status, modelId), header: "x-demo-rolling-used-percent", bareRecovery: true },
+	];
+	for (const provider of providers) {
+		it(`${provider.name} returns usage and freshness together`, () => {
+			const parsed = provider.parse({ [provider.header]: "1" }, 200, "test-model");
+			assert.ok(parsed);
+			assert.equal(parsed.hasSignal, true);
+			assert.equal(parsed.usage.source, "headers");
+		});
+		it(`${provider.name} distinguishes availability from quota signals`, () => {
+			const parsed = provider.parse({}, 200, "test-model");
+			if (provider.bareRecovery) {
+				assert.ok(parsed);
+				assert.equal(parsed.hasSignal, false);
+			} else {
+				assert.equal(parsed, undefined);
+			}
+			assert.equal(provider.parse({}, 500, "test-model"), undefined);
+		});
+		it(`${provider.name} reports bare HTTP 429 as a signal`, () => {
+			assert.equal(provider.parse({}, 429)?.hasSignal, true);
+		});
+	}
+});
+
+describe("parseCodexUsageHeaders", () => {
+	it("parses Codex quota headers", () => {
+		const usage = parseCodexUsageHeaders({
+			"x-codex-plan-type": "plus",
+			"x-codex-active-limit": "normal",
+			"x-codex-primary-used-percent": "42",
+			"x-codex-secondary-used-percent": "55",
+			"x-codex-primary-window-minutes": "300",
+			"x-codex-secondary-window-minutes": "10080",
+			"x-codex-primary-reset-after-seconds": "120",
+			"x-codex-secondary-reset-at": "2000000000",
+			"x-codex-credits-has-credits": "true",
+			"x-codex-credits-balance": "$5.00",
+		})?.usage;
+
+		assert.ok(usage);
+		assert.equal(usage.planType, "plus");
+		assert.equal(usage.primaryUsedPercent, 42);
+		assert.equal(usage.secondaryUsedPercent, 55);
+		assert.equal(usage.primaryResetAfterSeconds, 120);
+		assert.equal(usage.secondaryResetAt, 2000000000);
+		assert.equal(usage.creditsHasCredits, true);
+		assert.equal(usage.creditsBalance, "$5.00");
+		assert.equal(usage.source, "headers");
+	});
+
+	it("parses Codex 429 retry-after without confusing the active tier with status", () => {
+		const usage = parseCodexUsageHeaders({
+			"x-codex-active-limit": "premium",
+			"retry-after": "30",
+		}, 429)?.usage;
+		assert.ok(usage);
+		assert.equal(usage.activeLimit, "premium");
+		assert.equal(usage.rateLimited, true);
+		assert.equal(usage.primaryUsedPercent, undefined);
+		assert.equal(usage.secondaryUsedPercent, undefined);
+		assert.equal(usage.primaryResetAfterSeconds, 30);
+	});
+
+	it("preserves cached Codex fields when passive headers are partial", () => {
+		const previous = makeCodexUsage({
+			planType: "plus",
+			primaryUsedPercent: 42,
+			secondaryUsedPercent: 55,
+			primaryResetAt: 2_000_000_000,
+		});
+		const usage = parseCodexUsageHeaders({ "x-codex-active-limit": "normal" }, 200, previous)?.usage;
+		assert.ok(usage);
+		assert.equal(usage.planType, "plus");
+		assert.equal(usage.primaryUsedPercent, 42);
+		assert.equal(usage.secondaryUsedPercent, 55);
+		assert.equal(usage.primaryResetAt, 2_000_000_000);
+	});
+
+	it("clears stale Codex rate-limit status without clearing the active tier", () => {
+		const usage = parseCodexUsageHeaders(
+			{ "x-codex-primary-used-percent": "43" },
+			200,
+			makeCodexUsage({ activeLimit: "premium", rateLimited: true, primaryUsedPercent: 42 }),
+		)?.usage;
+		assert.ok(usage);
+		assert.equal(usage.activeLimit, "premium");
+		assert.equal(usage.rateLimited, false);
+		assert.equal(usage.primaryUsedPercent, 43);
+	});
+
+	it("discards stale absolute Codex resets when a fresh relative reset arrives", () => {
+		const previous = makeCodexUsage({
+			primaryResetAt: 2_000_000_000,
+			secondaryResetAt: 2_000_000_100,
+			codeReviewResetAt: 2_000_000_200,
+		});
+		const usage = parseCodexUsageHeaders({
+			"x-codex-primary-reset-after-seconds": "30",
+			"x-codex-secondary-reset-after-seconds": "60",
+			"x-codex-code-review-reset-after-seconds": "90",
+		}, 200, previous)?.usage;
+		assert.ok(usage);
+		assert.equal(usage.primaryResetAt, 0);
+		assert.equal(usage.secondaryResetAt, 0);
+		assert.equal(usage.codeReviewResetAt, 0);
+	});
+
+	it("discards a stale primary reset when Retry-After arrives", () => {
+		const usage = parseCodexUsageHeaders(
+			{ "retry-after": "30" },
+			429,
+			makeCodexUsage({ primaryResetAt: 2_000_000_000 }),
+		)?.usage;
+		assert.ok(usage);
+		assert.equal(usage.primaryResetAfterSeconds, 30);
+		assert.equal(usage.primaryResetAt, 0);
+	});
+
+	it("clears a stale primary reset when Retry-After is zero", () => {
+		const usage = parseCodexUsageHeaders(
+			{ "retry-after": "0" },
+			429,
+			makeCodexUsage({
+				primaryResetAfterSeconds: 3600,
+				primaryResetAt: 2_000_000_000,
+			}),
+		)?.usage;
+		assert.ok(usage);
+		assert.equal(usage.primaryResetAfterSeconds, 0);
+		assert.equal(usage.primaryResetAt, 0);
+	});
+
+	it("returns undefined when no relevant headers", () => {
+		assert.equal(parseCodexUsageHeaders({ server: "test" }, 200), undefined);
+	});
+});
+
+describe("checkCodexUsageFromUsageApi", () => {
+	const realFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = realFetch; });
+
+	it("keeps a weekly-only primary window without inventing a secondary window", async () => {
+		globalThis.fetch = (async () => new Response(JSON.stringify({
+			plan_type: "team",
+			rate_limit: {
+				limit_reached: false,
+				primary_window: {
+					used_percent: 12,
+					limit_window_seconds: 7 * 24 * 60 * 60,
+					reset_after_seconds: 6 * 24 * 60 * 60,
+				},
+				secondary_window: null,
+			},
+		}), { status: 200 })) as typeof fetch;
+
+		const result = await checkCodexUsageFromUsageApi("token", "account");
+		assert.ok(result.success);
+		if (!result.success) return;
+		assert.equal(result.usage.primaryUsedPercent, 12);
+		assert.equal(result.usage.primaryWindowMinutes, 7 * 24 * 60);
+		assert.equal(result.usage.secondaryUsedPercent, undefined);
+
+		const rendered = renderCodexWindows(result.usage, identity, false).join("\n");
+		assert.match(rendered, /week.*12%/);
+		assert.doesNotMatch(rendered, /168h/);
+		assert.doesNotMatch(rendered, /week.*0%/);
+	});
+
+	it("does not send a proxy-bound token to the official usage endpoint", async () => {
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response();
+		}) as typeof fetch;
+		const result = await checkCodexUsageFromUsageApi(
+			"token",
+			"account",
+			undefined,
+			"https://proxy.example/backend-api",
+		);
+		assert.equal(result.success, false);
+		assert.equal(called, false);
+	});
+});
+
+describe("parseAnthropicUsageHeaders", () => {
+	it("parses unified 5h/7d rate-limit headers", () => {
+		const usage = parseAnthropicUsageHeaders({
+			"anthropic-ratelimit-unified-5h-utilization": "0.36",
+			"anthropic-ratelimit-unified-5h-reset": "2000000000",
+			"anthropic-ratelimit-unified-5h-status": "allowed",
+			"anthropic-ratelimit-unified-7d-utilization": "0.03",
+			"anthropic-ratelimit-unified-7d-reset": "2000500000",
+			"anthropic-ratelimit-unified-status": "allowed",
+		}, 200, "claude-haiku-4-5")?.usage;
+
+		assert.ok(usage);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.workingModel, "claude-haiku-4-5");
+		assert.equal(usage.fiveHour?.utilizationPercent, 36);
+		assert.equal(usage.fiveHour?.resetAt, 2000000000);
+		assert.equal(usage.weekly?.utilizationPercent, 3);
+		assert.equal(usage.weekly?.resetAt, 2000500000);
+		assert.equal(usage.source, "headers");
+	});
+
+	it("marks rate limited when unified status is rejected", () => {
+		const usage = parseAnthropicUsageHeaders({
+			"anthropic-ratelimit-unified-5h-utilization": "1",
+			"anthropic-ratelimit-unified-status": "rejected",
+		}, 200, "claude-opus-4-8")?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "rate_limited");
+		assert.equal(usage.fiveHour?.utilizationPercent, 100);
+	});
+
+	it("infers Anthropic rate limit from 429 retry-after", () => {
+		const usage = parseAnthropicUsageHeaders({ "retry-after": "30" }, 429, "claude-sonnet-4-5")?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "rate_limited");
+		assert.equal(usage.rateLimitedModel, "claude-sonnet-4-5");
+		assert.equal(usage.retryAfterSeconds, 30);
+		assert.match(usage.errorMessage ?? "", /30s/);
+	});
+
+	it("preserves previous Anthropic windows on plain availability headers", () => {
+		const usage = parseAnthropicUsageHeaders({}, 200, "claude-haiku-4-5", {
+			available: false,
+			status: "rate_limited",
+			fiveHour: { utilizationPercent: 90 },
+			retryAfterSeconds: 30,
+		})?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.fiveHour?.utilizationPercent, 90);
+		assert.equal(usage.retryAfterSeconds, undefined);
+	});
+
+	it("returns undefined when no Anthropic signal is present", () => {
+		assert.equal(parseAnthropicUsageHeaders({ server: "test" }, 200), undefined);
+	});
+
+	it("distinguishes real Anthropic signal from bare successful responses", () => {
+		assert.equal(parseAnthropicUsageHeaders({ "anthropic-ratelimit-unified-status": "allowed" }, 200)?.hasSignal, true);
+		assert.equal(parseAnthropicUsageHeaders({}, 429)?.hasSignal, true);
+		assert.equal(parseAnthropicUsageHeaders({}, 402)?.hasSignal, true);
+		assert.equal(parseAnthropicUsageHeaders({ server: "test" }, 200, "claude-test")?.hasSignal, false);
+	});
+});
+
+describe("checkAnthropicUsageFromUsageApi", () => {
+	const realFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = realFetch; });
+
+	it("maps five_hour/seven_day utilization to windows", async () => {
+		globalThis.fetch = (async () => new Response(JSON.stringify({
+			five_hour: { utilization: 37, resets_at: "2030-01-01T00:00:00+00:00" },
+			seven_day: { utilization: 4, resets_at: "2030-01-08T00:00:00+00:00" },
+		}), { status: 200 })) as typeof fetch;
+		const r = await checkAnthropicUsageFromUsageApi("tok");
+		assert.ok(r.success);
+		if (!r.success) return;
+		assert.equal(r.usage.status, "available");
+		assert.equal(r.usage.source, "usage_api");
+		assert.equal(r.usage.authType, "oauth");
+		assert.equal(r.usage.fiveHour?.utilizationPercent, 37);
+		assert.equal(r.usage.weekly?.utilizationPercent, 4);
+		assert.ok((r.usage.fiveHour?.resetAt ?? 0) > 0);
+	});
+
+	it("marks rate limited at >=100% utilization", async () => {
+		globalThis.fetch = (async () => new Response(JSON.stringify({
+			five_hour: { utilization: 100 }, seven_day: { utilization: 50 },
+		}), { status: 200 })) as typeof fetch;
+		const r = await checkAnthropicUsageFromUsageApi("tok");
+		assert.ok(r.success);
+		if (!r.success) return;
+		assert.equal(r.usage.status, "rate_limited");
+	});
+
+	it("fails on non-ok responses", async () => {
+		globalThis.fetch = (async () => new Response("nope", { status: 403 })) as typeof fetch;
+		const r = await checkAnthropicUsageFromUsageApi("tok");
+		assert.equal(r.success, false);
+	});
+
+	it("does not send a proxy-bound token to the official usage endpoint", async () => {
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response();
+		}) as typeof fetch;
+		const r = await checkAnthropicUsageFromUsageApi("tok", undefined, "https://proxy.example/anthropic");
+		assert.equal(r.success, false);
+		assert.equal(called, false);
+	});
+});
+
+describe("isAnthropicModelUnavailable", () => {
+	it("matches unavailable model messages", () => {
+		assert.equal(isAnthropicModelUnavailable("model claude-x not found"), true);
+		assert.equal(isAnthropicModelUnavailable("unsupported model"), true);
+	});
+
+	it("does not match rate-limit messages", () => {
+		assert.equal(isAnthropicModelUnavailable("rate limit exceeded"), false);
+	});
+});
+
+describe("parseCopilotUsageHeaders", () => {
+	it("parses generic Copilot rate-limit headers", () => {
+		const reset = Math.round(Date.now() / 1000) + 60;
+		const usage = parseCopilotUsageHeaders({
+			"x-ratelimit-limit": "100",
+			"x-ratelimit-remaining": "80",
+			"x-ratelimit-used": "20",
+			"x-ratelimit-reset": String(reset),
+			"x-ratelimit-resource": "copilot",
+		}, 200, "gpt-5-mini")?.usage;
+
+		assert.ok(usage);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.workingModel, "gpt-5-mini");
+		assert.equal(usage.requests?.usedPercent, 20);
+		assert.equal(usage.requests?.remainingPercent, 80);
+		assert.equal(usage.requests?.resource, "copilot");
+		assert.ok((usage.requests?.resetAfterSeconds ?? 0) > 0);
+	});
+
+	it("parses future Copilot premium request headers", () => {
+		const usage = parseCopilotUsageHeaders({
+			"x-copilot-premium-requests-used-percent": "40",
+			"x-copilot-premium-requests-remaining-percent": "60",
+			"x-copilot-premium-requests-reset-after-seconds": "120",
+		}, 200, "gpt-5-mini")?.usage;
+
+		assert.ok(usage);
+		assert.equal(usage.premiumRequests?.usedPercent, 40);
+		assert.equal(usage.premiumRequests?.remainingPercent, 60);
+		assert.equal(usage.premiumRequests?.resetAfterSeconds, 120);
+	});
+
+	it("infers Copilot rate limit from 429 retry-after", () => {
+		const usage = parseCopilotUsageHeaders({ "retry-after": "45" }, 429, "gpt-5-mini")?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "rate_limited");
+		assert.equal(usage.rateLimitedModel, "gpt-5-mini");
+		assert.equal(usage.retryAfterSeconds, 45);
+		assert.match(usage.errorMessage ?? "", /45s/);
+	});
+
+	it("preserves previous Copilot quota on successful availability headers", () => {
+		const usage = parseCopilotUsageHeaders({}, 200, "gpt-5-mini", {
+			available: false,
+			status: "rate_limited",
+			premiumRequests: { usedPercent: 70, remainingPercent: 30 },
+			retryAfterSeconds: 30,
+		})?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.premiumRequests?.usedPercent, 70);
+		assert.equal(usage.retryAfterSeconds, undefined);
+	});
+
+	it("returns undefined when no Copilot signal is present", () => {
+		assert.equal(parseCopilotUsageHeaders({ server: "test" }, 200), undefined);
+	});
+
+	it("distinguishes real Copilot signal from bare successful responses", () => {
+		assert.equal(parseCopilotUsageHeaders({ "x-ratelimit-remaining": "10" }, 200)?.hasSignal, true);
+		assert.equal(parseCopilotUsageHeaders({ "x-copilot-quota": "1" }, 200)?.hasSignal, true);
+		assert.equal(parseCopilotUsageHeaders({}, 429)?.hasSignal, true);
+		assert.equal(parseCopilotUsageHeaders({}, 402)?.hasSignal, true);
+		assert.equal(parseCopilotUsageHeaders({ server: "test" }, 200, "gpt-test")?.hasSignal, false);
+	});
+});
+
+describe("Copilot helpers", () => {
+	it("normalizes enterprise domains", () => {
+		assert.equal(normalizeCopilotDomain("https://company.ghe.com/path"), "company.ghe.com");
+		assert.equal(normalizeCopilotDomain("company.ghe.com"), "company.ghe.com");
+	});
+
+	it("extracts base URL from Copilot token proxy endpoint", () => {
+		assert.equal(getCopilotBaseUrl("tid=x;proxy-ep=proxy.enterprise.githubcopilot.com;exp=1"), "https://api.enterprise.githubcopilot.com");
+	});
+
+	it("falls back to enterprise base URL", () => {
+		assert.equal(getCopilotBaseUrl("token", "company.ghe.com"), "https://copilot-api.company.ghe.com");
+	});
+
+	it("matches unavailable and quota messages", () => {
+		assert.equal(isCopilotModelUnavailable("model gpt-x not found"), true);
+		assert.equal(isCopilotQuotaMessage("premium requests quota exceeded"), true);
+		assert.equal(isCopilotQuotaMessage("model not found"), false);
+	});
+});
+
+describe("parseSubscriptionUsageHeaders", () => {
+	const zenConfig: SubscriptionProviderConfig = {
+		provider: "opencode",
+		label: "OpenCode Zen",
+		shortLabel: "Zen",
+		quotaHeaderPrefixes: ["opencode"],
+	};
+
+	it("parses generic subscription quota headers", () => {
+		const parsed = parseSubscriptionUsageHeaders(zenConfig, {
+			"x-opencode-status": "available",
+			"x-opencode-model": "big-pickle",
+			"x-opencode-rolling-used-percent": "33",
+			"x-opencode-weekly-remaining-percent": "44",
+			"x-opencode-monthly-reset-after-seconds": "7200",
+		}, 200);
+
+		assert.ok(parsed);
+		assert.equal(parsed.hasSignal, true);
+		const usage = parsed.usage;
+		assert.equal(usage.provider, "opencode");
+		assert.equal(usage.status, "available");
+		assert.equal(usage.workingModel, "big-pickle");
+		assert.equal(usage.rolling?.usedPercent, 33);
+		assert.equal(usage.rolling?.remainingPercent, 67);
+		assert.equal(usage.weekly?.remainingPercent, 44);
+		assert.equal(usage.monthly?.resetAfterSeconds, 7200);
+	});
+
+	it("infers generic subscription rate limit from 429", () => {
+		const parsed = parseSubscriptionUsageHeaders(zenConfig, { "retry-after": "20" }, 429, "big-pickle");
+		assert.ok(parsed);
+		assert.equal(parsed.hasSignal, true);
+		assert.equal(parsed.usage.status, "rate_limited");
+		assert.equal(parsed.usage.rateLimitedModel, "big-pickle");
+		assert.match(parsed.usage.errorMessage ?? "", /20s/);
+	});
+
+	for (const modelId of [undefined, "big-pickle"]) {
+		it(`recognizes bare HTTP 402 as a signal (${modelId ?? "no model"})`, () => {
+			const parsed = parseSubscriptionUsageHeaders(zenConfig, {}, 402, modelId);
+			assert.ok(parsed);
+			assert.equal(parsed.hasSignal, true);
+			assert.equal(parsed.usage.available, false);
+			assert.equal(parsed.usage.status, "credits_error");
+			assert.equal(parsed.usage.rateLimitedModel, modelId);
+			assert.equal(parsed.usage.errorMessage, "Quota exhausted");
+		});
+	}
+
+	it("returns undefined without a generic subscription signal", () => {
+		assert.equal(parseSubscriptionUsageHeaders(zenConfig, { server: "test" }, 200), undefined);
+	});
+
+	it("treats bare successful responses as no quota signal", () => {
+		const previous = {
+			provider: "opencode",
+			label: "OpenCode Zen",
+			shortLabel: "Zen",
+			available: true,
+			status: "available",
+			rolling: { usedPercent: 100, resetAt: 1 },
+		} satisfies SubscriptionUsage;
+		const parsed = parseSubscriptionUsageHeaders(zenConfig, { server: "test" }, 200, "big-pickle", previous);
+
+		// Still parses (status/model recovery), but must not count as freshness.
+		assert.ok(parsed);
+		assert.equal(parsed.hasSignal, false);
+		assert.equal(parsed.usage.status, "available");
+		assert.equal(parsed.usage.workingModel, "big-pickle");
+		assert.equal(parsed.usage.rolling?.usedPercent, 100);
+	});
+});
+
+describe("checkSubscriptionProviderUsage with a usage endpoint", () => {
+	const realFetch = globalThis.fetch;
+	afterEach(() => { globalThis.fetch = realFetch; });
+	const auth = { apiKey: "test-key", baseUrl: "https://api.example/v1", source: "test" };
+	const config: SubscriptionProviderConfig = {
+		provider: "demo",
+		label: "Demo",
+		shortLabel: "Demo",
+		usageApi: { url: "https://api.example/v1/usages", parse: parseKimiUsagePayload },
+		documentedModels: [{ id: "demo-model", api: "openai-completions", endpoint: "https://api.example/v1/chat/completions", costRank: 0 }],
+	};
+	const ctx = { modelRegistry: { getProvider: () => undefined } } as unknown as Pick<UsageContext, "modelRegistry">;
+
+	for (const used of [32, 100]) {
+		it(`uses the quota endpoint without a model probe (${used}% used)`, async () => {
+			const requests: string[] = [];
+			globalThis.fetch = async (url, init) => {
+				requests.push(String(url));
+				assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer test-key");
+				assert.equal(init?.redirect, "error");
+				assert.ok(init?.signal);
+				return Response.json({ usage: { limit: "100", used: String(used) } });
+			};
+			const usage = await checkSubscriptionProviderUsage(ctx, config, auth);
+			assert.deepEqual(requests, [config.usageApi!.url]);
+			assert.equal(usage.source, "usage_api");
+			assert.equal(usage.weekly?.usedPercent, used);
+			assert.equal(usage.available, used < 100);
+			assert.equal(usage.status, used < 100 ? "available" : "rate_limited");
+		});
+	}
+
+	it("renders both errors when the usage API and fallback probe fail", async () => {
+		const requests: string[] = [];
+		globalThis.fetch = async (url) => {
+			requests.push(String(url));
+			return String(url).endsWith("/usages")
+				? new Response("usage exploded", { status: 500 })
+				: Response.json({ error: { message: "probe exploded" } }, { status: 500 });
+		};
+		const usage = await checkSubscriptionProviderUsage(ctx, config, auth);
+		assert.equal(usage.status, "error");
+		assert.deepEqual(requests, [config.usageApi!.url, config.documentedModels![0].endpoint]);
+		const expected = "Demo usage API: usage exploded; fallback probe: demo-model: probe exploded";
+		assert.equal(usage.errorMessage, expected);
+		assert.equal(usage.error, expected);
+		assert.ok(buildStartupUsageMessage({ subscriptions: [usage] }, false).includes(expected));
+	});
+
+	it("falls back after an unusable usage payload", async () => {
+		const requests: string[] = [];
+		globalThis.fetch = async (url) => {
+			requests.push(String(url));
+			return Response.json({});
+		};
+		const usage = await checkSubscriptionProviderUsage(ctx, config, auth);
+		assert.equal(requests.length, 2);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.workingModel, "demo-model");
+		assert.equal(usage.errorMessage, undefined);
+	});
+
+	it("does not fall back when the usage request is aborted", async () => {
+		const controller = new AbortController();
+		let requests = 0;
+		globalThis.fetch = async () => {
+			requests++;
+			controller.abort();
+			throw new Error("usage request aborted");
+		};
+		const usage = await checkSubscriptionProviderUsage(ctx, config, auth, controller.signal);
+		assert.equal(requests, 1);
+		assert.equal(usage.source, "usage_api");
+		assert.equal(usage.status, "error");
+	});
+
+	it("never sends a custom-provider key to the official quota endpoint", async () => {
+		const requests: string[] = [];
+		globalThis.fetch = async (url) => {
+			requests.push(String(url));
+			return new Response(null, { status: 200 });
+		};
+		const usage = await checkSubscriptionProviderUsage(ctx, {
+			...config,
+			documentedModels: [{ ...config.documentedModels![0], endpoint: "https://proxy.example/v1/chat/completions" }],
+		}, { ...auth, baseUrl: "https://proxy.example/v1" });
+		assert.equal(usage.status, "available");
+		assert.deepEqual(requests, ["https://proxy.example/v1/chat/completions"]);
+	});
+});
+
+describe("getSubscriptionCheckModels", () => {
+	const config: SubscriptionProviderConfig = {
+		provider: "opencode",
+		label: "OpenCode Zen",
+		shortLabel: "Zen",
+		supportedApis: ["openai-completions", "anthropic-messages"],
+		preferredModelIds: ["big-pickle"],
+		documentedModels: [
+			{ id: "big-pickle", api: "openai-completions", endpoint: "https://opencode.ai/zen/v1/chat/completions", costRank: 0 },
+			{ id: "claude-haiku-4-5", api: "anthropic-messages", endpoint: "https://opencode.ai/zen/v1/messages", costRank: 3 },
+		],
+	};
+
+	it("prefers the selected model first", async () => {
+		const models = await getSubscriptionCheckModels(config, {
+			provider: "opencode", id: "claude-haiku-4-5", api: "anthropic-messages", baseUrl: "https://opencode.ai/zen/v1",
+		});
+		assert.equal(models[0].id, "claude-haiku-4-5");
+	});
+
+	it("injects the selected model when it is not already listed", async () => {
+		const models = await getSubscriptionCheckModels(config, {
+			provider: "opencode", id: "custom-zen-model", api: "openai-completions", baseUrl: "https://opencode.ai/zen/v1",
+		});
+		assert.equal(models[0].id, "custom-zen-model");
+		assert.equal(models[0].endpoint, "https://opencode.ai/zen/v1/chat/completions");
+	});
+
+	it("ignores a selected model from another provider", async () => {
+		const models = await getSubscriptionCheckModels(config, {
+			provider: "anthropic", id: "totally-foreign-model", api: "anthropic-messages", baseUrl: "https://api.anthropic.com",
+		});
+		assert.ok(!models.some((m) => m.id === "totally-foreign-model"));
+		assert.equal(models[0].id, "big-pickle");
+	});
+
+	it("keeps only endpoints on the origin bound to the key", async () => {
+		const ctx = {
+			modelRegistry: {
+				getProvider: () => ({
+					getModels: () => [{
+						id: "big-pickle",
+						api: "openai-completions",
+						baseUrl: "https://proxy.example/zen/v1",
+						cost: {},
+					}],
+				}),
+			},
+		} as unknown as Pick<UsageContext, "modelRegistry">;
+		const models = await getSubscriptionCheckModels(config, undefined, ctx, "https://proxy.example/zen");
+
+		assert.deepEqual(models.map((model) => model.endpoint), ["https://proxy.example/zen/v1/chat/completions"]);
+	});
+});
+
+describe("generic subscription helpers", () => {
+	it("matches model unavailable messages", () => {
+		assert.equal(isSubscriptionModelUnavailable("model foo is not enabled"), true);
+		assert.equal(isSubscriptionModelUnavailable("unsupported model"), true);
+		assert.equal(isSubscriptionModelUnavailable("quota exceeded"), false);
+	});
+
+	it("matches quota messages", () => {
+		assert.equal(isSubscriptionQuotaMessage("subscription quota exceeded"), true);
+		assert.equal(isSubscriptionQuotaMessage("too many requests"), true);
+		assert.equal(isSubscriptionQuotaMessage("model not found"), false);
+	});
+});
+
+describe("reconcileOpenCodeGoRefresh", () => {
+	it("keeps exhausted merged quota limited after a passive success", () => {
+		const result = makeGoUsage({
+			available: false,
+			status: "rate_limited",
+			rolling: { usedPercent: 100 },
+		});
+		const merged = makeGoUsage({ rolling: { usedPercent: 100 }, source: "headers" });
+
+		assert.deepEqual(reconcileOpenCodeGoRefresh(result, merged), {
+			...merged,
+			available: false,
+			status: "rate_limited",
+		});
+	});
+
+	it("preserves a newer passive limit", () => {
+		const result = makeGoUsage({ rolling: { usedPercent: 20 } });
+		const merged = makeGoUsage({ available: false, status: "rate_limited" });
+		assert.equal(reconcileOpenCodeGoRefresh(result, merged), merged);
+	});
+
+	it("does not apply stale exhaustion to newer non-exhausted quota", () => {
+		const result = makeGoUsage({
+			available: false,
+			status: "rate_limited",
+			rolling: { usedPercent: 100 },
+		});
+		const merged = makeGoUsage({ rolling: { usedPercent: 20 }, source: "headers" });
+		assert.equal(reconcileOpenCodeGoRefresh(result, merged), merged);
+	});
+});
+
+describe("parseOpenCodeGoUsageHeaders", () => {
+	it("identifies quota windows present in the current headers", () => {
+		assert.deepEqual(getOpenCodeGoQuotaHeaderWindows({
+			"x-opencode-go-rolling-used-percent": "25",
+			"x-opencode-quota-monthly-reset-at": "2000000000",
+		}), ["rolling", "monthly"]);
+		assert.equal(hasOpenCodeGoQuotaHeaders({
+			"x-opencode-quota-weekly-reset-at": "2000000000",
+		}), true);
+		assert.equal(hasOpenCodeGoQuotaHeaders({
+			"x-opencode-go-status": "available",
+		}), false);
+	});
+
+	it("requires usage data for every window before treating quota as complete", () => {
+		assert.equal(hasCompleteGoQuotaData(makeGoUsage({
+			rolling: { usedPercent: 25 },
+			weekly: { usedPercent: 50 },
+		})), false);
+		assert.equal(hasCompleteGoQuotaData(makeGoUsage({
+			rolling: { usedPercent: 25 },
+			weekly: { usedPercent: 50 },
+			monthly: { usedPercent: 0 },
+		})), true);
+	});
+
+	it("parses passive Go quota headers", () => {
+		const usage = parseOpenCodeGoUsageHeaders({
+			"x-opencode-go-status": "available",
+			"x-opencode-go-model": "glm-5.1",
+			"x-opencode-go-rolling-used-percent": "25",
+			"x-opencode-go-weekly-used-percent": "50",
+			"x-opencode-go-monthly-reset-after-seconds": "3600",
+		}, 200)?.usage;
+
+		assert.ok(usage);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.workingModel, "glm-5.1");
+		assert.equal(usage.rolling?.usedPercent, 25);
+		assert.equal(usage.rolling?.remainingPercent, 75);
+		assert.equal(usage.weekly?.usedPercent, 50);
+		assert.equal(usage.monthly?.resetAfterSeconds, 3600);
+		assert.equal(usage.quotaSource, "response headers");
+	});
+
+	it("infers rate limited Go status from 429", () => {
+		const usage = parseOpenCodeGoUsageHeaders({ "retry-after": "15" }, 429, "glm-5.1")?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "rate_limited");
+		assert.equal(usage.rateLimitedModel, "glm-5.1");
+		assert.match(usage.errorMessage ?? "", /15s/);
+	});
+
+	it("preserves previous Go quota when only model availability is known", () => {
+		const usage = parseOpenCodeGoUsageHeaders({}, 200, "glm-5.1", makeGoUsage({
+			available: false,
+			status: "rate_limited",
+			rolling: { usedPercent: 20, remainingPercent: 80 },
+		}))?.usage;
+		assert.ok(usage);
+		assert.equal(usage.status, "available");
+		assert.equal(usage.workingModel, "glm-5.1");
+		assert.equal(usage.rolling?.usedPercent, 20);
+		assert.equal(usage.errorMessage, undefined);
+	});
+
+	it("preserves a dashboard quota error on plain availability headers", () => {
+		const usage = parseOpenCodeGoUsageHeaders({}, 200, "glm-5.1", makeGoUsage({ quotaError: "boom" }))?.usage;
+		assert.ok(usage);
+		assert.equal(usage.quotaError, "boom");
+	});
+
+	it("clears a stale quota error when fresh quota headers arrive", () => {
+		const usage = parseOpenCodeGoUsageHeaders({
+			"x-opencode-go-rolling-used-percent": "25",
+		}, 200, "glm-5.1", makeGoUsage({ quotaError: "boom" }))?.usage;
+		assert.ok(usage);
+		assert.equal(usage.quotaError, undefined);
+	});
+
+	it("distinguishes real Go signal from bare successful responses", () => {
+		assert.equal(parseOpenCodeGoUsageHeaders({ "x-opencode-go-rolling-used-percent": "25" }, 200)?.hasSignal, true);
+		assert.equal(parseOpenCodeGoUsageHeaders({}, 429)?.hasSignal, true);
+		assert.equal(parseOpenCodeGoUsageHeaders({}, 402)?.hasSignal, true);
+		assert.equal(parseOpenCodeGoUsageHeaders({ server: "test" }, 200, "glm-test")?.hasSignal, false);
+	});
+});
+
+// ───────── window helpers ─────────
+
+describe("windowUsedPercent", () => {
+	it("returns clamped percent from window", () => {
+		assert.equal(windowUsedPercent({ used_percent: 50 }), 50);
+	});
+
+	it("returns 0 for null/undefined", () => {
+		assert.equal(windowUsedPercent(null), 0);
+		assert.equal(windowUsedPercent(undefined), 0);
+	});
+
+	it("clamps out-of-range", () => {
+		assert.equal(windowUsedPercent({ used_percent: 150 }), 100);
+		assert.equal(windowUsedPercent({ used_percent: -10 }), 0);
+	});
+});
+
+describe("windowMinutes", () => {
+	it("converts seconds to minutes", () => {
+		assert.equal(windowMinutes({ limit_window_seconds: 300 }, 100), 5);
+	});
+
+	it("returns fallback for null/undefined", () => {
+		assert.equal(windowMinutes(null, 100), 100);
+		assert.equal(windowMinutes(undefined, 100), 100);
+	});
+
+	it("returns fallback for zero seconds", () => {
+		assert.equal(windowMinutes({ limit_window_seconds: 0 }, 42), 42);
+	});
+});
+
+describe("windowResetAfterSeconds", () => {
+	it("returns rounded reset_after_seconds", () => {
+		assert.equal(windowResetAfterSeconds({ reset_after_seconds: 3600.7 }), 3601);
+	});
+
+	it("returns 0 for null/undefined", () => {
+		assert.equal(windowResetAfterSeconds(null), 0);
+		assert.equal(windowResetAfterSeconds(undefined), 0);
+	});
+
+	it("returns 0 for zero/negative", () => {
+		assert.equal(windowResetAfterSeconds({ reset_after_seconds: 0 }), 0);
+		assert.equal(windowResetAfterSeconds({ reset_after_seconds: -5 }), 0);
+	});
+});
+
+describe("windowResetAt", () => {
+	it("returns reset_at when present", () => {
+		assert.equal(windowResetAt({ reset_at: 1000 }), 1000);
+	});
+
+	it("computes from reset_after when reset_at missing", () => {
+		const before = Math.round(Date.now() / 1000);
+		const result = windowResetAt({ reset_after_seconds: 3600 });
+		const after = Math.round(Date.now() / 1000);
+		assert.ok(result! >= before + 3600 && result! <= after + 3600);
+	});
+
+	it("returns 0 when both missing", () => {
+		assert.equal(windowResetAt(null), 0);
+		assert.equal(windowResetAt(undefined), 0);
+	});
+});
+
+// ───────── formatResetTime ─────────
+
+describe("formatResetTime", () => {
+	it("returns 'now' for past timestamp", () => {
+		const past = Math.round(Date.now() / 1000) - 10;
+		assert.equal(formatResetTime(past), "now");
+	});
+
+	it("returns duration for future timestamp", () => {
+		const future = Math.floor(Date.now() / 1000) + 9000;
+		const result = formatResetTime(future);
+		assert.equal(result, "2.5h");
+	});
+});
+
+// ───────── statusIcon ─────────
+
+describe("statusIcon", () => {
+	it("returns check for available", () => {
+		assert.equal(statusIcon("available"), "✓");
+	});
+
+	it("returns hourglass for rate_limited", () => {
+		assert.equal(statusIcon("rate_limited"), "⏳");
+	});
+
+	it("returns cross for credits_error", () => {
+		assert.equal(statusIcon("credits_error"), "✗");
+	});
+
+	it("returns warning for error", () => {
+		assert.equal(statusIcon("error"), "⚠");
+	});
+
+	it("returns em-dash for no_key", () => {
+		assert.equal(statusIcon("no_key"), "—");
+	});
+});
+
+// ───────── codexUsageHasData ─────────
+
+describe("codexUsageHasData", () => {
+	it("returns true for normal usage", () => {
+		assert.equal(codexUsageHasData(makeCodexUsage()), true);
+	});
+
+	it("returns false for undefined", () => {
+		assert.equal(codexUsageHasData(undefined), false);
+	});
+
+	it("returns false when error is set", () => {
+		assert.equal(codexUsageHasData(makeCodexUsage({ error: "some error" })), false);
+	});
+
+	it("returns true for a rate limit with an active tier and error detail", () => {
+		assert.equal(codexUsageHasData(makeCodexUsage({
+			activeLimit: "premium",
+			rateLimited: true,
+			error: "Rate limited (429)",
+		})), true);
+	});
+});
+
+// ───────── usageHasData ─────────
+
+describe("usageHasData", () => {
+	it("returns true for available and limited statuses", () => {
+		assert.equal(usageHasData({ status: "available" }), true);
+		assert.equal(usageHasData({ status: "rate_limited" }), true);
+		assert.equal(usageHasData({ status: "credits_error" }), true);
+		assert.equal(usageHasData({ status: "error" }), true);
+	});
+
+	it("returns false for undefined", () => {
+		assert.equal(usageHasData(undefined), false);
+	});
+
+	it("returns false for no_key", () => {
+		assert.equal(usageHasData({ status: "no_key" }), false);
+	});
+});
+
+// ───────── extractAccountId ─────────
+
+describe("extractAccountId", () => {
+	it("extracts account ID from valid JWT", () => {
+		const payload = Buffer.from(JSON.stringify({
+			"https://api.openai.com/auth": { chatgpt_account_id: "acc_123" },
+		})).toString("base64url");
+		const token = `header.${payload}.signature`;
+		assert.equal(extractAccountId(token), "acc_123");
+	});
+
+	it("returns undefined for non-3-part token", () => {
+		assert.equal(extractAccountId("invalid.token"), undefined);
+	});
+
+	it("returns undefined for malformed payload", () => {
+		const token = "header.invalid-base64!.signature";
+		assert.equal(extractAccountId(token), undefined);
+	});
+
+	it("returns undefined for missing account ID", () => {
+		const payload = Buffer.from(JSON.stringify({})).toString("base64url");
+		const token = `header.${payload}.signature`;
+		assert.equal(extractAccountId(token), undefined);
+	});
+});
+
+// ───────── readResponseText ─────────
+
+describe("readResponseText", () => {
+	it("returns empty string for null body", async () => {
+		const response = new Response(null);
+		assert.equal(await readResponseText(response), "");
+	});
+
+	it("reads text body correctly", async () => {
+		const response = new Response("hello world");
+		assert.equal(await readResponseText(response), "hello world");
+	});
+
+	it("reads empty body", async () => {
+		const response = new Response("");
+		assert.equal(await readResponseText(response), "");
+	});
+
+	it("reads multi-chunk body", async () => {
+		const encoder = new TextEncoder();
+		const stream = new ReadableStream({
+			start(controller) {
+				controller.enqueue(encoder.encode("chunk1"));
+				controller.enqueue(encoder.encode("chunk2"));
+				controller.close();
+			},
+		});
+		const response = new Response(stream);
+		assert.equal(await readResponseText(response), "chunk1chunk2");
+	});
+
+	it("handles large body close to size limit", async () => {
+		const data = "x".repeat(512_000);
+		const response = new Response(data);
+		const text = await readResponseText(response);
+		assert.equal(text.length, 512_000);
+	});
+
+	it("rejects when body exceeds size limit", async () => {
+		const data = "x".repeat(512_001);
+		const response = new Response(data);
+		await assert.rejects(
+			readResponseText(response),
+			/Response body exceeded/,
+		);
+	});
+
+	it("reads JSON body", async () => {
+		const response = new Response(JSON.stringify({ key: "value" }));
+		assert.equal(await readResponseText(response), '{"key":"value"}');
+	});
+});
+
+// ───────── cancelResponseBody ─────────
+
+describe("cancelResponseBody", () => {
+	it("handles null body gracefully", async () => {
+		const response = new Response(null);
+		await cancelResponseBody(response);
+	});
+
+	it("cancels body stream", async () => {
+		const response = new Response("test");
+		await cancelResponseBody(response);
+	});
+});
+
+// ───────── renderCodexWindows ─────────
+
+describe("codexWindowLabel", () => {
+	it("uses semantic labels for standard Codex windows", () => {
+		assert.equal(codexWindowLabel(300, "5hr"), "5hr");
+		assert.equal(codexWindowLabel(10080, "5hr"), "week");
+	});
+
+	it("formats nonstandard windows and falls back for invalid durations", () => {
+		assert.equal(codexWindowLabel(1440, "5hr"), "1d");
+		assert.equal(codexWindowLabel(90, "5hr"), "1.5h");
+		assert.equal(codexWindowLabel(0, "week"), "week");
+	});
+});
+
+describe("renderCodexWindows", () => {
+	it("renders code review and credits when present", () => {
+		const result = renderCodexWindows(
+			makeCodexUsage({
+				planType: "plus",
+				primaryUsedPercent: 42,
+				secondaryUsedPercent: 60,
+				codeReviewUsedPercent: 10,
+				codeReviewWindowMinutes: 1440,
+				codeReviewResetAfterSeconds: 86400,
+				primaryOverSecondaryLimitPercent: 10,
+				creditsHasCredits: true,
+				creditsBalance: "$5.00",
+			}),
+			identity,
+			false,
+		);
+		const joined = result.join("\n");
+		assert.match(joined, /Codex/);
+		assert.match(joined, /plus/);
+		assert.match(joined, /review/);
+		assert.match(joined, /credits/);
+		assert.match(joined, /\$5\.00/);
+		assert.match(joined, /10%/);
+		assert.match(joined, /42%/);
+		assert.match(joined, /60%/);
+	});
+
+	it("shows plan type when non-unknown", () => {
+		const result = renderCodexWindows(
+			makeCodexUsage({ planType: "enterprise", primaryUsedPercent: 10, secondaryUsedPercent: 20 }),
+			identity,
+			false,
+		);
+		assert.match(result.join("\n"), /enterprise/);
+	});
+
+	it("renders error state", () => {
+		const result = renderCodexWindows(
+			makeCodexUsage({ source: "probe", error: "API connection failed" }),
+			identity,
+			false,
+		);
+		assert.match(result.join("\n"), /✗ Codex/);
+		assert.match(result.join("\n"), /API connection failed/);
+	});
+
+	it("shows the active tier and rate_limited label", () => {
+		const result = renderCodexWindows(
+			makeCodexUsage({
+				activeLimit: "premium",
+				rateLimited: true,
+				primaryUsedPercent: 100,
+				secondaryUsedPercent: 50,
+				primaryResetAt: Math.floor(Date.now() / 1000) + 300,
+				source: "probe",
+				error: "Rate limited (429)",
+			}),
+			identity,
+			false,
+		);
+		const joined = result.join("\n");
+		assert.match(joined, /premium/);
+		assert.match(joined, /rate_limited/);
+	});
+
+	it("renders a retry countdown when rate limited without quota percentages", () => {
+		const result = renderCodexWindows(
+			makeCodexUsage({
+				rateLimited: true,
+				primaryUsedPercent: undefined,
+				secondaryUsedPercent: undefined,
+				primaryResetAfterSeconds: 30,
+			}),
+			identity,
+			false,
+		).join("\n");
+		assert.match(result, /retry: 30s/);
+	});
+
+	it("renders a primary retry countdown alongside a cached secondary quota", () => {
+		const result = renderCodexWindows(
+			makeCodexUsage({
+				rateLimited: true,
+				primaryUsedPercent: undefined,
+				secondaryUsedPercent: 55,
+				primaryResetAfterSeconds: 30,
+			}),
+			identity,
+			false,
+		).join("\n");
+		assert.match(result, /week.*55%/);
+		assert.match(result, /retry: 30s/);
+	});
+});
+
+// ───────── updateFooterStatus ─────────
+
+describe("updateFooterStatus", () => {
+	it("renders a Codex retry countdown without quota percentages", () => {
+		let status: string | undefined;
+		const ctx = {
+			hasUI: true,
+			ui: {
+				theme: { fg: (_color: string, text: string) => text },
+				setStatus: (_id: string, value: string | undefined) => { status = value; },
+			},
+		} as any;
+		const codex = makeCodexUsage({
+			activeLimit: "premium",
+			rateLimited: true,
+			primaryUsedPercent: undefined,
+			secondaryUsedPercent: undefined,
+			primaryResetAfterSeconds: 30,
+			error: "Rate limited (429)",
+		});
+
+		updateFooterStatus(ctx, { codex, subscriptions: [] });
+
+		assert.match(status ?? "", /⏳\/30s/);
+	});
+
+	it("keeps the Codex retry countdown with a cached secondary quota", () => {
+		let status: string | undefined;
+		const ctx = {
+			hasUI: true,
+			ui: {
+				theme: { fg: (_color: string, text: string) => text },
+				setStatus: (_id: string, value: string | undefined) => { status = value; },
+			},
+		} as any;
+		const codex = makeCodexUsage({
+			activeLimit: "premium",
+			rateLimited: true,
+			primaryUsedPercent: undefined,
+			secondaryUsedPercent: 55,
+			primaryResetAfterSeconds: 30,
+			error: "Rate limited (429)",
+		});
+
+		updateFooterStatus(ctx, { codex, subscriptions: [] });
+
+		assert.match(status ?? "", /⏳\/30s,55%/);
+	});
+});
+
+// ───────── renderAnthropicWindows ─────────
+
+describe("renderAnthropicWindows", () => {
+	it("renders 5hr/week utilization windows", () => {
+		const anthropic: AnthropicUsage = {
+			available: true,
+			status: "available",
+			authType: "oauth",
+			source: "usage_api",
+			fiveHour: { utilizationPercent: 36, resetAfterSeconds: 7200 },
+			weekly: { utilizationPercent: 3, resetAfterSeconds: 520000 },
+		};
+		const result = renderAnthropicWindows(anthropic, identity, false);
+		const joined = result.join("\n");
+		assert.match(joined, /Anthropic/);
+		assert.match(joined, /Claude Pro\/Max/);
+		assert.match(joined, /5hr/);
+		assert.match(joined, /week/);
+		assert.match(joined, /36%/);
+		assert.match(joined, /3%/);
+		assert.match(joined, /resets in/);
+	});
+
+	it("renders retry-only rate limit", () => {
+		const anthropic: AnthropicUsage = {
+			available: false,
+			status: "rate_limited",
+			authType: "oauth",
+			rateLimitedModel: "claude-sonnet-4-5",
+			retryAfterSeconds: 30,
+			errorMessage: "Rate limited",
+		};
+		const result = renderAnthropicWindows(anthropic, identity, false).join("\n");
+		assert.match(result, /rate limited/);
+		assert.match(result, /retry: 30s/);
+		assert.match(result, /claude-sonnet-4-5/);
+	});
+
+	it("counts retry delays down from their absolute reset time", () => {
+		const anthropic: AnthropicUsage = {
+			available: false,
+			status: "rate_limited",
+			retryAfterSeconds: 30,
+			retryResetAt: Math.floor(Date.now() / 1000) - 1,
+		};
+		const result = renderAnthropicWindows(anthropic, identity, false).join("\n");
+		assert.match(result, /retry: now/);
+		assert.doesNotMatch(result, /retry: 30s/);
+	});
+
+	it("renders with color when useColor=true", () => {
+		const anthropic: AnthropicUsage = {
+			available: true,
+			status: "available",
+			fiveHour: { utilizationPercent: 50 },
+		};
+		const colorFmt = (color: string, text: string) => `[${color}:${text}]`;
+		const result = renderAnthropicWindows(anthropic, colorFmt, true).join("\n");
+		assert.match(result, /\[success/);
+	});
+});
+
+// ───────── renderCopilotWindows ─────────
+
+describe("renderCopilotWindows", () => {
+	it("renders Copilot quota windows", () => {
+		const copilot: CopilotUsage = {
+			available: true,
+			status: "available",
+			workingModel: "gpt-5-mini",
+			premiumRequests: { usedPercent: 40, remainingPercent: 60, resetAfterSeconds: 120 },
+			requests: { usedPercent: 10, remainingPercent: 90, resetAfterSeconds: 60 },
+			availableModels: 12,
+		};
+		const result = renderCopilotWindows(copilot, identity, false).join("\n");
+		assert.match(result, /GitHub Copilot/);
+		assert.match(result, /premium/);
+		assert.match(result, /requests/);
+		assert.match(result, /40%/);
+		assert.match(result, /gpt-5-mini/);
+		assert.match(result, /12 account models/);
+	});
+
+	it("renders retry-only rate limit", () => {
+		const copilot: CopilotUsage = {
+			available: false,
+			status: "rate_limited",
+			rateLimitedModel: "gpt-5-mini",
+			retryAfterSeconds: 45,
+			errorMessage: "Rate limited",
+		};
+		const result = renderCopilotWindows(copilot, identity, false).join("\n");
+		assert.match(result, /rate limited/);
+		assert.match(result, /retry: 45s/);
+		assert.match(result, /gpt-5-mini/);
+	});
+
+	it("renders with color when useColor=true", () => {
+		const copilot: CopilotUsage = {
+			available: true,
+			status: "available",
+			requests: { usedPercent: 50, remainingPercent: 50 },
+		};
+		const colorFmt = (color: string, text: string) => `[${color}:${text}]`;
+		const result = renderCopilotWindows(copilot, colorFmt, true).join("\n");
+		assert.match(result, /\[success/);
+	});
+});
+
+// ───────── renderGoWindows ─────────
+
+describe("renderGoWindows", () => {
+	it("renders quota data windows", () => {
+		const go = makeGoUsage({
+			rolling: { usedPercent: 20, remainingPercent: 80, resetAfterSeconds: 11520 },
+			weekly: { usedPercent: 40, remainingPercent: 60, resetAt: Math.floor(Date.now() / 1000) + 604800 },
+			monthly: { usedPercent: 60, remainingPercent: 40, resetAt: Math.floor(Date.now() / 1000) + 2592000 },
+			quotaSource: "/path/to/config",
+		});
+		const result = renderGoWindows(go, identity, false);
+		const joined = result.join("\n");
+		assert.match(joined, /OpenCode Go/);
+		assert.match(joined, /20%/);
+		assert.match(joined, /40%/);
+		assert.match(joined, /60%/);
+		assert.match(joined, /rolling/);
+		assert.match(joined, /week/);
+		assert.match(joined, /month/);
+	});
+
+	it("renders no_key status", () => {
+		const result = renderGoWindows(makeGoUsage({ available: false, status: "no_key" }), identity, false);
+		assert.match(result.join("\n"), /no key/);
+	});
+
+	it("renders rate_limited with error message", () => {
+		const go = makeGoUsage({
+			available: false,
+			status: "rate_limited",
+			rateLimitedModel: "qwen3.5-plus",
+			errorMessage: "Rate limit exceeded",
+			checkedModels: 3,
+			totalModels: 10,
+		});
+		const result = renderGoWindows(go, identity, false);
+		const joined = result.join("\n");
+		assert.match(joined, /rate limited/);
+		assert.match(joined, /qwen3\.5-plus/);
+		assert.match(joined, /Rate limit exceeded/);
+		assert.match(joined, /3\/10/);
+	});
+
+	it("renders quotaError line", () => {
+		const go = makeGoUsage({ quotaError: "Dashboard parse error", workingModel: "glm-5.1" });
+		const result = renderGoWindows(go, identity, false);
+		const joined = result.join("\n");
+		assert.match(joined, /Dashboard parse error/);
+		assert.match(joined, /glm-5\.1/);
+	});
+
+	it("renders with color when useColor=true", () => {
+		const go = makeGoUsage({ rolling: { usedPercent: 50, remainingPercent: 50, resetAfterSeconds: 3600 } });
+		const colorFmt = (color: string, text: string) => `[${color}:${text}]`;
+		const result = renderGoWindows(go, colorFmt, true);
+		assert.match(result.join("\n"), /\[success/);
+	});
+});
+
+// ───────── renderSubscriptionWindows ─────────
+
+describe("renderSubscriptionWindows", () => {
+	it("renders generic subscription quota windows", () => {
+		const subscription: SubscriptionUsage = {
+			provider: "opencode",
+			label: "OpenCode Zen",
+			shortLabel: "Zen",
+			available: true,
+			status: "available",
+			workingModel: "big-pickle",
+			rolling: { usedPercent: 35, remainingPercent: 65, resetAfterSeconds: 3600 },
+			checkedModels: 1,
+			totalModels: 4,
+		};
+		const result = renderSubscriptionWindows(subscription, identity, false).join("\n");
+		assert.match(result, /OpenCode Zen/);
+		assert.match(result, /rolling/);
+		assert.match(result, /35%/);
+		assert.match(result, /big-pickle/);
+		assert.match(result, /1\/4/);
+	});
+
+	it("renders retry-only generic subscription rate limit", () => {
+		const subscription: SubscriptionUsage = {
+			provider: "opencode",
+			label: "OpenCode Zen",
+			shortLabel: "Zen",
+			available: false,
+			status: "rate_limited",
+			rateLimitedModel: "big-pickle",
+			retryAfterSeconds: 30,
+		};
+		const result = renderSubscriptionWindows(subscription, identity, false).join("\n");
+		assert.match(result, /rate limited/);
+		assert.match(result, /retry: 30s/);
+		assert.match(result, /big-pickle/);
+	});
+
+	it("renders expired windows as stale instead of the stale percentage", () => {
+		const subscription: SubscriptionUsage = {
+			provider: "kimi-coding",
+			label: "Kimi Coding",
+			shortLabel: "Kimi",
+			available: true,
+			status: "available",
+			rolling: { usedPercent: 100, remainingPercent: 0, resetAt: Math.round(Date.now() / 1000) - 30 },
+			weekly: { usedPercent: 61, remainingPercent: 39, resetAt: Math.round(Date.now() / 1000) + 86400 },
+		};
+		const result = renderSubscriptionWindows(subscription, identity, false).join("\n");
+		assert.match(result, /rolling/);
+		assert.match(result, /-- used.*stale/);
+		assert.doesNotMatch(result, /refreshing/);
+		assert.doesNotMatch(result, /100%/);
+		assert.match(result, /61%/);
+	});
+});
+
+// ───────── buildUsageWidget ─────────
+
+describe("buildUsageWidget", () => {
+	const mockTheme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as any;
+
+	const widgetText = (widget: string[]): string => widget.join("\n");
+
+	it("renders loading state", () => {
+		const result = buildUsageWidget({ subscriptions: [] }, mockTheme, true);
+		assert.match(widgetText(result), /Checking usage limits/);
+	});
+
+	it("keeps completed providers visible while remaining checks load", () => {
+		const subscription: SubscriptionUsage = {
+			provider: "zai",
+			label: "Z.AI",
+			shortLabel: "Z.AI",
+			available: true,
+			status: "available",
+		};
+		const result = widgetText(buildUsageWidget({ subscriptions: [subscription] }, mockTheme, true));
+		assert.match(result, /Z\.AI/);
+		assert.match(result, /Checking usage limits/);
+	});
+
+	it("renders with both services configured", () => {
+		const codex = makeCodexUsage({ planType: "plus", primaryUsedPercent: 30, secondaryUsedPercent: 40 });
+		const result = widgetText(buildUsageWidget({ codex, go: makeGoUsage(), subscriptions: [] }, mockTheme, false));
+		assert.match(result, /Usage Limits/);
+		assert.match(result, /Codex/);
+		assert.match(result, /OpenCode Go/);
+	});
+
+	it("omits unconfigured services instead of showing 'not configured'", () => {
+		const result = widgetText(buildUsageWidget({ subscriptions: [] }, mockTheme, false));
+		assert.doesNotMatch(result, /not configured/);
+		assert.doesNotMatch(result, /Codex/);
+		assert.doesNotMatch(result, /OpenCode Go/);
+		assert.match(result, /Usage Limits/);
+	});
+
+	it("renders generic subscription providers", () => {
+		const subscription: SubscriptionUsage = {
+			provider: "opencode",
+			label: "OpenCode Zen",
+			shortLabel: "Zen",
+			available: true,
+			status: "available",
+			workingModel: "big-pickle",
+		};
+		const result = widgetText(buildUsageWidget({ subscriptions: [subscription] }, mockTheme, false));
+		assert.match(result, /OpenCode Zen/);
+		assert.match(result, /big-pickle/);
+	});
+
+	it("shows partial services", () => {
+		const codex = makeCodexUsage({ primaryUsedPercent: 50, secondaryUsedPercent: 50 });
+		const result = widgetText(buildUsageWidget({ codex, subscriptions: [] }, mockTheme, false));
+		assert.match(result, /Codex/);
+		assert.doesNotMatch(result, /not configured/);
+		assert.doesNotMatch(result, /OpenCode Go/);
+	});
+});
+
+// ───────── buildStartupUsageMessage ─────────
+
+describe("buildStartupUsageMessage", () => {
+	it("includes help when requested", () => {
+		const result = buildStartupUsageMessage({ subscriptions: [] }, true);
+		assert.match(result, /showWidget/);
+	});
+
+	it("omits help when not requested", () => {
+		const result = buildStartupUsageMessage({ subscriptions: [] }, false);
+		assert.doesNotMatch(result, /showWidget/);
+	});
+
+	it("renders both services", () => {
+		const codex = makeCodexUsage({ planType: "plus", primaryUsedPercent: 30, secondaryUsedPercent: 40 });
+		const result = buildStartupUsageMessage({ codex, go: makeGoUsage(), subscriptions: [] }, false);
+		assert.match(result, /Usage Limits/);
+		assert.match(result, /Codex/);
+		assert.match(result, /OpenCode Go/);
+	});
+
+	it("omits unconfigured services instead of showing 'not configured'", () => {
+		const result = buildStartupUsageMessage({ subscriptions: [] }, false);
+		assert.doesNotMatch(result, /not configured/);
+		assert.doesNotMatch(result, /Codex/);
+		assert.doesNotMatch(result, /OpenCode Go/);
+	});
+
+	it("renders generic subscription providers", () => {
+		const subscription: SubscriptionUsage = {
+			provider: "opencode",
+			label: "OpenCode Zen",
+			shortLabel: "Zen",
+			available: true,
+			status: "available",
+			workingModel: "big-pickle",
+		};
+		const result = buildStartupUsageMessage({ subscriptions: [subscription] }, false);
+		assert.match(result, /OpenCode Zen/);
+		assert.match(result, /big-pickle/);
+	});
+});
+
+// ───────── configPathCandidates ─────────
+
+describe("configPathCandidates", () => {
+	afterEach(() => {
+		delete process.env.OPENCODE_GO_QUOTA_CONFIG;
+		delete process.env.XDG_CONFIG_HOME;
+	});
+
+	it("includes explicit env var path", () => {
+		process.env.OPENCODE_GO_QUOTA_CONFIG = "/custom/path/opencode-go.json";
+		const result = configPathCandidates("opencode-go.json");
+		assert.ok(result.includes("/custom/path/opencode-go.json"));
+	});
+
+	it("includes XDG_CONFIG_HOME path", () => {
+		process.env.XDG_CONFIG_HOME = "/xdg/config";
+		const result = configPathCandidates("opencode-go.json");
+		assert.ok(result.includes("/xdg/config/opencode/opencode-go.json"));
+	});
+
+	it("includes ~/.config path", () => {
+		const result = configPathCandidates("opencode-go.json");
+		assert.ok(result.some(p => p.includes("/.config/opencode/opencode-go.json")));
+	});
+
+	it("deduplicates paths", () => {
+		process.env.OPENCODE_GO_QUOTA_CONFIG = "/some/dup.json";
+		process.env.XDG_CONFIG_HOME = "/some";
+		const result = configPathCandidates("dup.json");
+		const dups = result.filter(p => p === "/some/dup.json");
+		assert.equal(dups.length, 1);
+	});
+
+	it("returns non-empty list", () => {
+		const result = configPathCandidates("test.json");
+		assert.ok(result.length > 0);
+	});
+});
+
+// ───────── getOpenCodeGoQuotaConfig ─────────
+
+describe("getOpenCodeGoQuotaConfig", () => {
+	afterEach(() => {
+		delete process.env.OPENCODE_GO_WORKSPACE_ID;
+		delete process.env.OPENCODE_GO_AUTH_COOKIE;
+	});
+
+	it("returns config from env vars", () => {
+		process.env.OPENCODE_GO_WORKSPACE_ID = "ws-123";
+		process.env.OPENCODE_GO_AUTH_COOKIE = "cookie-value";
+		const result = getOpenCodeGoQuotaConfig();
+		assert.equal(result.config?.workspaceId, "ws-123");
+		assert.equal(result.config?.authCookie, "cookie-value");
+		assert.equal(result.config?.source, "env");
+	});
+
+	it("returns error when only one env var set", () => {
+		process.env.OPENCODE_GO_WORKSPACE_ID = "ws-123";
+		const result = getOpenCodeGoQuotaConfig();
+		assert.ok(result.error!.includes("both"));
+	});
+
+	it("returns empty state when no config found", () => {
+		const result = getOpenCodeGoQuotaConfig();
+		assert.equal(result.config, undefined);
+		assert.equal(result.error, undefined);
+	});
+});
+
+// ───────── validatePrivateConfigFile ─────────
+
+describe("validatePrivateConfigFile", () => {
+	it("throws ENOENT for non-existent file", () => {
+		assert.throws(() => validatePrivateConfigFile("/nonexistent/path.json"), /ENOENT/);
+	});
+
+	it("returns undefined for valid file", () => {
+		const tmpFile = `/tmp/pi-usage-test-${Date.now()}.json`;
+		fs.writeFileSync(tmpFile, JSON.stringify({}), { mode: 0o600 });
+		const result = validatePrivateConfigFile(tmpFile);
+		assert.equal(result, undefined);
+		fs.unlinkSync(tmpFile);
+	});
+});
+
+// ───────── readJsonObject ─────────
+
+describe("readJsonObject", () => {
+	it("returns undefined for non-existent file", () => {
+		assert.equal(readJsonObject("/nonexistent/file.json"), undefined);
+	});
+
+	it("returns undefined for invalid JSON", () => {
+		const tmpFile = `/tmp/pi-usage-test-${Date.now()}.json`;
+		fs.writeFileSync(tmpFile, "not json");
+		assert.equal(readJsonObject(tmpFile), undefined);
+		fs.unlinkSync(tmpFile);
+	});
+
+	it("returns undefined for array JSON", () => {
+		const tmpFile = `/tmp/pi-usage-test-${Date.now()}.json`;
+		fs.writeFileSync(tmpFile, JSON.stringify([1, 2, 3]));
+		assert.equal(readJsonObject(tmpFile), undefined);
+		fs.unlinkSync(tmpFile);
+	});
+
+	it("parses valid JSON object", () => {
+		const tmpFile = `/tmp/pi-usage-test-${Date.now()}.json`;
+		fs.writeFileSync(tmpFile, JSON.stringify({ key: "value" }));
+		const result = readJsonObject(tmpFile);
+		assert.deepEqual(result, { key: "value" });
+		fs.unlinkSync(tmpFile);
+	});
+});
+
+// ───────── widgetSettingFromConfig ─────────
+
+describe("widgetSettingFromConfig", () => {
+	it("returns undefined for undefined config", () => {
+		assert.equal(widgetSettingFromConfig(undefined), undefined);
+	});
+
+	it("reads showWidget boolean", () => {
+		assert.equal(widgetSettingFromConfig({ showWidget: true }), true);
+		assert.equal(widgetSettingFromConfig({ showWidget: false }), false);
+	});
+
+	it("reads showWidget string", () => {
+		assert.equal(widgetSettingFromConfig({ showWidget: "true" }), true);
+		assert.equal(widgetSettingFromConfig({ showWidget: "false" }), false);
+	});
+
+	it("falls back to widget field", () => {
+		assert.equal(widgetSettingFromConfig({ widget: true }), true);
+	});
+
+	it("prefers showWidget over widget", () => {
+		assert.equal(widgetSettingFromConfig({ showWidget: true, widget: false }), true);
+		assert.equal(widgetSettingFromConfig({ showWidget: false, widget: true }), false);
+	});
+});
+
+// ───────── parseOpenCodeGoUsageWindow ─────────
+
+describe("parseOpenCodeGoUsageWindow", () => {
+	it("parses rolling usage from HTML", () => {
+		const html = "<script>rollingUsage:$R[42]={usagePercent:35.5,resetInSec:7200}</script>";
+		const result = parseOpenCodeGoUsageWindow(html, "rolling");
+		assert.ok(result !== undefined);
+		assert.equal(result!.usedPercent, 35.5);
+		assert.equal(result!.remainingPercent, 64.5);
+	});
+
+	it("parses weekly usage", () => {
+		const html = "<script>weeklyUsage:$R[0]={usagePercent:80,resetInSec:604800}</script>";
+		const result = parseOpenCodeGoUsageWindow(html, "weekly");
+		assert.ok(result !== undefined);
+		assert.equal(result!.usedPercent, 80);
+	});
+
+	it("parses monthly usage", () => {
+		const html = "<script>monthlyUsage:$R[1]={usagePercent:50,resetInSec:2592000}</script>";
+		const result = parseOpenCodeGoUsageWindow(html, "monthly");
+		assert.ok(result !== undefined);
+		assert.equal(result!.usedPercent, 50);
+	});
+
+	it("returns undefined for missing window", () => {
+		const html = "<script>otherData: true</script>";
+		assert.equal(parseOpenCodeGoUsageWindow(html, "rolling"), undefined);
+	});
+
+	it("returns undefined for missing usagePercent", () => {
+		const html = "<script>rollingUsage:$R[0]={resetInSec:3600}</script>";
+		assert.equal(parseOpenCodeGoUsageWindow(html, "rolling"), undefined);
+	});
+
+	it("clamps usage percent", () => {
+		const html = "<script>rollingUsage:$R[0]={usagePercent:150,resetInSec:3600}</script>";
+		const result = parseOpenCodeGoUsageWindow(html, "rolling");
+		assert.ok(result !== undefined);
+		assert.equal(result!.usedPercent, 100);
+	});
+
+	it("handles missing resetInSec with zero", () => {
+		const html = "<script>rollingUsage:$R[0]={usagePercent:30}</script>";
+		const result = parseOpenCodeGoUsageWindow(html, "rolling");
+		assert.ok(result !== undefined);
+		assert.equal(result!.usedPercent, 30);
+		assert.equal(result!.resetAfterSeconds, 0);
+	});
+});
+
+// ───────── parseOpenCodeGoDashboardUsage ─────────
+
+describe("parseOpenCodeGoDashboardUsage", () => {
+	it("parses all three windows from full dashboard", () => {
+		const html = [
+			"<html><body><script>",
+			"var data = {};",
+			"rollingUsage:$R[0]={usagePercent:20,resetInSec:3600}",
+			"weeklyUsage:$R[0]={usagePercent:50,resetInSec:604800}",
+			"monthlyUsage:$R[0]={usagePercent:75,resetInSec:2592000}",
+			"</script></body></html>",
+		].join("\n");
+		const result = parseOpenCodeGoDashboardUsage(html);
+		assert.equal(result.error, undefined);
+		assert.equal(result.rolling?.usedPercent, 20);
+		assert.equal(result.weekly?.usedPercent, 50);
+		assert.equal(result.monthly?.usedPercent, 75);
+	});
+
+	it("parses partial data (only weekly and monthly)", () => {
+		const html = [
+			"<script>",
+			"weeklyUsage:$R[0]={usagePercent:30,resetInSec:604800}",
+			"monthlyUsage:$R[0]={usagePercent:60,resetInSec:2592000}",
+			"</script>",
+		].join("\n");
+		const result = parseOpenCodeGoDashboardUsage(html);
+		assert.equal(result.rolling, undefined);
+		assert.equal(result.weekly?.usedPercent, 30);
+		assert.equal(result.monthly?.usedPercent, 60);
+	});
+
+	it("returns error for unrecognized structure", () => {
+		const html = "<html><body>Not a dashboard page</body></html>";
+		const result = parseOpenCodeGoDashboardUsage(html);
+		assert.ok(result.error!.includes("not recognized"));
+		assert.equal(result.rolling, undefined);
+	});
+});
+
+// ───────── parseKimiUsagePayload ─────────
+
+describe("parseKimiUsagePayload", () => {
+	const basePayload = {
+		usage: { limit: "100", used: "32", remaining: "68", resetTime: "2026-07-25T15:50:46.822466Z" },
+		limits: [
+			{
+				window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
+				detail: { limit: "100", used: "8", remaining: "92", resetTime: "2026-07-23T20:50:46.822466Z" },
+			},
+		],
+	};
+
+	it("maps top-level usage to weekly and 300-minute window to rolling", () => {
+		const result = parseKimiUsagePayload(basePayload);
+		assert.ok(result);
+		assert.equal(result.weekly?.usedPercent, 32);
+		assert.equal(result.weekly?.remainingPercent, 68);
+		assert.equal(result.rolling?.usedPercent, 8);
+		assert.equal(result.rolling?.remainingPercent, 92);
+	});
+
+	it("parses ISO reset times into unix seconds", () => {
+		const result = parseKimiUsagePayload(basePayload);
+		assert.ok(result);
+		assert.equal(result.weekly?.resetAt, Math.round(Date.parse("2026-07-25T15:50:46.822466Z") / 1000));
+		assert.equal(result.rolling?.resetAt, Math.round(Date.parse("2026-07-23T20:50:46.822466Z") / 1000));
+	});
+
+	it("accepts numeric values as well as strings", () => {
+		const result = parseKimiUsagePayload({
+			usage: { limit: 200, used: 50, remaining: 150, resetTime: "2026-07-25T00:00:00Z" },
+		});
+		assert.equal(result?.weekly?.usedPercent, 25);
+	});
+
+	it("classifies sub-windows by duration", () => {
+		const result = parseKimiUsagePayload({
+			limits: [
+				{ window: { duration: 5, timeUnit: "TIME_UNIT_HOUR" }, detail: { limit: "10", used: "1", remaining: "9", resetTime: "2026-07-23T20:00:00Z" } },
+				{ window: { duration: 7, timeUnit: "TIME_UNIT_DAY" }, detail: { limit: "10", used: "5", remaining: "5", resetTime: "2026-07-30T00:00:00Z" } },
+				{ window: { duration: 1, timeUnit: "TIME_UNIT_MONTH" }, detail: { limit: "10", used: "9", remaining: "1", resetTime: "2026-08-22T00:00:00Z" } },
+			],
+		});
+		assert.equal(result?.rolling?.usedPercent, 10);
+		assert.equal(result?.weekly?.usedPercent, 50);
+		assert.equal(result?.monthly?.usedPercent, 90);
+	});
+
+	it("derives remainingPercent from usedPercent when remaining is missing", () => {
+		const result = parseKimiUsagePayload({
+			usage: { limit: "100", used: "40", resetTime: "2026-07-25T00:00:00Z" },
+		});
+		assert.equal(result?.weekly?.remainingPercent, 60);
+	});
+
+	it("returns undefined for unusable payloads", () => {
+		assert.equal(parseKimiUsagePayload(undefined), undefined);
+		assert.equal(parseKimiUsagePayload(null), undefined);
+		assert.equal(parseKimiUsagePayload({}), undefined);
+		assert.equal(parseKimiUsagePayload({ usage: { limit: "abc", used: "def" } }), undefined);
+	});
+});
