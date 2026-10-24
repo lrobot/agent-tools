@@ -1,5 +1,14 @@
 import { test, expect } from "bun:test";
-import { groupModelsByApi, resolveBaseUrlV1, toModelConfigs } from "./index";
+import { groupModelsByApi, providerRegistrationId, resolveBaseUrlV1, toModelConfigs } from "./index";
+
+test("providerRegistrationId uses the instance name; suffixes only when needed", () => {
+  expect(providerRegistrationId("kimiqq", "anthropic-messages", 1)).toBe("kimiqq");
+  expect(providerRegistrationId("kimitoken", "openai-completions", 1)).toBe("kimitoken");
+  expect(providerRegistrationId("globalaijc", "anthropic-messages", 2)).toBe("globalaijc");
+  expect(providerRegistrationId("globalaijc", "openai-completions", 2)).toBe("globalaijc-openai");
+  // Reserved names keep the legacy prefixed id so they never shadow builtins.
+  expect(providerRegistrationId("openai", "anthropic-messages", 1)).toBe("dotc-openai-anthropic-messages");
+});
 
 test("resolveBaseUrlV1 prefers base_url_v1 when present", () => {
   expect(resolveBaseUrlV1({ base_url: "https://api.example.com", base_url_v1: "https://api.example.com/v1" })).toBe(

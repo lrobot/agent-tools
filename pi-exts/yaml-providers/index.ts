@@ -94,6 +94,36 @@ export function resolveBaseUrlV1(provider: Pick<ProviderEntry, "base_url" | "bas
   return provider.base_url;
 }
 
+// Provider ids use the yaml instance name directly (kimiqq, deepseektoken).
+// A provider serving both APIs gets the bare name for anthropic-messages (the
+// coding-agent transport) and a short -openai suffix for the extra group.
+// Names colliding with pi builtin providers keep the legacy dotted id and a
+// warning, so a stray "openai" instance cannot shadow the real builtin.
+const RESERVED_PROVIDER_IDS = new Set([
+  "anthropic",
+  "antigravity",
+  "github-copilot",
+  "google",
+  "kimi-coding",
+  "openai",
+  "openai-codex",
+  "opencode",
+  "opencode-go",
+  "openrouter",
+  "xai",
+  "zai",
+  "zai-coding-cn",
+  "xiaomi-token-plan-ams",
+  "xiaomi-token-plan-cn",
+  "xiaomi-token-plan-sgp",
+]);
+
+export function providerRegistrationId(instanceName: string, api: string, apiGroupCount: number): string {
+  if (RESERVED_PROVIDER_IDS.has(instanceName)) return `dotc-${instanceName}-${api}`;
+  if (apiGroupCount <= 1) return instanceName;
+  return api === "anthropic-messages" ? instanceName : `${instanceName}-openai`;
+}
+
 interface BuildResult {
   warning?: string;
   registrations?: Array<{ id: string; config: Record<string, unknown> }>;
@@ -150,20 +180,24 @@ async function buildProviderConfig(
   }
 
   const baseUrl = resolveBaseUrlV1(provider);
-  const registrations = [...groupModelsByApi(toModelConfigs(models, contextRefFor))].map(([api, models]) => ({
-    id: `dotc-${instanceName}-${api}`,
+  const groups = [...groupModelsByApi(toModelConfigs(models, contextRefFor))];
+  const reservedWarning = RESERVED_PROVIDER_IDS.has(instanceName)
+    ? `instance ${instanceName}: name collides with a builtin provider; registered with legacy dotc- id`
+    : undefined;
+  const registrations = groups.map(([api, groupModels]) => ({
+    id: providerRegistrationId(instanceName, api, groups.length),
     config: {
       name: provider.name ?? instanceName,
       baseUrl,
       apiKey: secretEntry.secret,
       api,
       authHeader: !!provider.secret_use_as_auth_token && api === "anthropic-messages",
-      models,
+      models: groupModels,
     },
   }));
 
   return {
-    warning: [r.warning, contextRefWarning, excludeWarning].filter(Boolean).join("; ") || undefined,
+    warning: [r.warning, contextRefWarning, excludeWarning, reservedWarning].filter(Boolean).join("; ") || undefined,
     registrations,
   };
 }
@@ -197,7 +231,7 @@ export default async function (pi: any) {
   }
 
   pi.registerCommand("modelreload", {
-    description: "Force-refresh live model lists for dotc providers, bypassing the cache",
+    description: "Force-refresh live model lists for yaml providers, bypassing the cache",
     handler: async (args: string, ctx: any) => {
       const activeTargets = Object.keys(instances).filter((name) => isInstanceInProfile(instances[name]));
       const targets = args.trim() ? [args.trim()] : activeTargets;
