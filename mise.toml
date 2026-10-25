@@ -34,6 +34,10 @@ run_windows = "pwsh -NoProfile -File ./scripts/setup-providers-link.ps1"
 description = "Link the yaml-providers extension into oh-my-pi and install its npm deps"
 run = "./scripts/setup-omp-ext.sh"
 
+[tasks.publish-pi-ui-multiselect]
+description = "Publish pi-exts/pi-ui-multiselect to standalone repo (git subtree split + push to main)"
+run = "./scripts/publish-pi-ui-multiselect.sh"
+
 [tasks.postinstall-all]
 description = "Run all postinstall setup tasks"
 depends = ["build-cld", "setup-providers-link", "setup-omp-ext"]
