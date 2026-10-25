@@ -1,4 +1,5 @@
 export type MultiSelectMode = "ordered" | "checkbox";
+export type PaneFocus = "available" | "selected";
 
 export interface MultiSelectItem {
   value: string;
@@ -26,6 +27,8 @@ export interface MultiSelectListOptions {
   keybindings?: KeybindingsLike;
   title?: string;
   hint?: string;
+  showSearch?: boolean;
+  dualPane?: boolean;
   onConfirm?: (selected: string[]) => void;
   onCancel?: () => void;
   onChange?: (selected: string[]) => void;
@@ -39,5 +42,7 @@ export interface MultiSelectPromptOptions {
   mode?: MultiSelectMode;
   maxVisible?: number;
   hint?: string;
+  showSearch?: boolean;
+  dualPane?: boolean;
   overlay?: boolean;
 }

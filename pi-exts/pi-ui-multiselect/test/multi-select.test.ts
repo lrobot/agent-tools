@@ -55,26 +55,132 @@ test("MultiSelectList ordered mode: toggle, ranking and re-indexing", () => {
   // model-b should now be primary, model-c should be failover 1
   assert.deepEqual(list.getSelectedValues(), ["model-b", "model-c"]);
 
-  // Render and check badges
+  // Render and check badges in left and right columns
   const lines = list.render(80);
-  assert.ok(lines.some((l) => l.includes("[1]") && l.includes("model-b") && l.includes("Primary")));
-  assert.ok(lines.some((l) => l.includes("[2]") && l.includes("model-c") && l.includes("Failover 1")));
-  assert.ok(lines.some((l) => l.includes("[ ]") && l.includes("model-a")));
+  assert.ok(lines.some((l) => l.includes("[1]") && l.includes("model-b")), "left pane has [1] for model-b");
+  assert.ok(lines.some((l) => l.includes("1.") && l.includes("model-b") && l.includes("Primary")), "right pane has 1. model-b (Primary)");
+  assert.ok(lines.some((l) => l.includes("[2]") && l.includes("model-c")), "left pane has [2] for model-c");
+  assert.ok(lines.some((l) => l.includes("2.") && l.includes("model-c") && l.includes("Failover 1")), "right pane has 2. model-c (Failover 1)");
+  assert.ok(lines.some((l) => l.includes("[ ]") && l.includes("model-a")), "left pane has [ ] for model-a");
 });
 
 test("MultiSelectList navigation wrap-around and cursor bounds", () => {
   const items = ["first", "middle", "last"];
   const list = new MultiSelectList({ items });
 
-  assert.equal(list.getCursorIndex(), 0);
+  assert.equal(list.getCursorAvailable(), 0);
 
   // Up from 0 wraps to last item
   list.handleInput("\x1b[A");
-  assert.equal(list.getCursorIndex(), 2);
+  assert.equal(list.getCursorAvailable(), 2);
 
   // Down from last wraps to 0
   list.handleInput("\x1b[B");
-  assert.equal(list.getCursorIndex(), 0);
+  assert.equal(list.getCursorAvailable(), 0);
+});
+
+test("MultiSelectList search filtering and selection persistence", () => {
+  const items = [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "anthropic/claude-sonnet-4-5",
+  ];
+  const list = new MultiSelectList({ items });
+
+  // 1. Select the first item (deepseek flash)
+  list.handleInput(" ");
+  assert.deepEqual(list.getSelectedValues(), ["deepseek/deepseek-v4-flash"]);
+
+  // 2. Type "gpt" in search
+  list.handleInput("g");
+  list.handleInput("p");
+  list.handleInput("t");
+  assert.equal(list.getSearchQuery(), "gpt");
+
+  const filtered = list.getFilteredItems();
+  assert.equal(filtered.length, 2);
+  assert.equal(filtered[0].value, "openai/gpt-4o");
+  assert.equal(filtered[1].value, "openai/gpt-4o-mini");
+
+  // Even though deepseek-v4-flash is filtered out of view, it is STILL selected!
+  assert.deepEqual(list.getSelectedValues(), ["deepseek/deepseek-v4-flash"]);
+
+  // 3. Select gpt-4o from filtered list
+  list.handleInput(" ");
+  assert.deepEqual(list.getSelectedValues(), ["deepseek/deepseek-v4-flash", "openai/gpt-4o"]);
+
+  // 4. Backspace twice to "g"
+  list.handleInput("\x7f");
+  list.handleInput("\x7f");
+  assert.equal(list.getSearchQuery(), "g");
+
+  // 5. Ctrl+U clears search query
+  list.handleInput("\x15");
+  assert.equal(list.getSearchQuery(), "");
+  assert.equal(list.getFilteredItems().length, 5);
+  assert.deepEqual(list.getSelectedValues(), ["deepseek/deepseek-v4-flash", "openai/gpt-4o"]);
+});
+
+test("MultiSelectList Tab focus switching, remove, and reordering", () => {
+  const items = ["model-1", "model-2", "model-3", "model-4"];
+  const list = new MultiSelectList({
+    items,
+    initialSelected: ["model-1", "model-2", "model-3"],
+  });
+
+  assert.equal(list.getFocusPane(), "available");
+
+  // Tab switches to selected pane
+  list.handleInput("\t");
+  assert.equal(list.getFocusPane(), "selected");
+  assert.equal(list.getCursorSelected(), 0);
+
+  // In selected pane, move down to model-2
+  list.handleInput("\x1b[B");
+  assert.equal(list.getCursorSelected(), 1);
+
+  // Reorder: Move model-2 UP to index 0 using '['
+  list.handleInput("[");
+  assert.deepEqual(list.getSelectedValues(), ["model-2", "model-1", "model-3"]);
+  assert.equal(list.getCursorSelected(), 0);
+
+  // Reorder: Move model-2 DOWN to index 1 using ']'
+  list.handleInput("]");
+  assert.deepEqual(list.getSelectedValues(), ["model-1", "model-2", "model-3"]);
+  assert.equal(list.getCursorSelected(), 1);
+
+  // Reorder with Alt+Up / Alt+Down escape codes
+  list.handleInput("\x1b\x1b[A"); // Alt+Up
+  assert.deepEqual(list.getSelectedValues(), ["model-2", "model-1", "model-3"]);
+
+  // Remove model-2 from selected list with Space or 'd'
+  list.handleInput("d");
+  assert.deepEqual(list.getSelectedValues(), ["model-1", "model-3"]);
+
+  // Tab switches back to available pane
+  list.handleInput("\t");
+  assert.equal(list.getFocusPane(), "available");
+});
+
+test("MultiSelectList dual-pane rendering vs stacked rendering", () => {
+  const items = ["alpha", "beta", "gamma"];
+  const list = new MultiSelectList({
+    items,
+    initialSelected: ["alpha", "beta"],
+    title: "Dual Pane Test",
+  });
+
+  // Wide terminal >= 80 renders side-by-side with '│' divider
+  const wideLines = list.render(90);
+  assert.ok(wideLines.some((l) => l.includes("AVAILABLE CANDIDATES") && l.includes("│") && l.includes("SELECTED BACKENDS")));
+  assert.ok(wideLines.some((l) => l.includes("alpha") && l.includes("│")));
+
+  // Narrow terminal < 80 renders stacked layout
+  const narrowLines = list.render(60);
+  assert.ok(narrowLines.some((l) => l.includes("Available (3)")));
+  assert.ok(narrowLines.some((l) => l.includes("Selected (2)")));
 });
 
 test("MultiSelectList checkbox mode: select-all and toggle", () => {
@@ -84,12 +190,12 @@ test("MultiSelectList checkbox mode: select-all and toggle", () => {
     mode: "checkbox",
   });
 
-  // 'a' selects all
-  list.handleInput("a");
+  // Ctrl+A (\x01) selects all
+  list.handleInput("\x01");
   assert.deepEqual(list.getSelectedValues(), ["feat1", "feat2", "feat3"]);
 
-  // 'a' again clears all
-  list.handleInput("a");
+  // Ctrl+A again clears all
+  list.handleInput("\x01");
   assert.deepEqual(list.getSelectedValues(), []);
 
   // Space toggles single

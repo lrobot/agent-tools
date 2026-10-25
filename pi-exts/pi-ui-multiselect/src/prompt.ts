@@ -42,6 +42,8 @@ export async function promptMultiSelect(
         initialSelected: options.initialSelected,
         mode: options.mode ?? "ordered",
         maxVisible: options.maxVisible,
+        showSearch: options.showSearch,
+        dualPane: options.dualPane,
         title: options.title,
         hint: options.hint,
         theme,

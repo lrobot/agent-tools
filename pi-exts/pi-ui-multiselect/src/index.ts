@@ -7,5 +7,6 @@ export type {
   MultiSelectMode,
   MultiSelectPromptOptions,
   MultiSelectTheme,
+  PaneFocus,
 } from "./types.ts";
 export { truncateToWidth, visibleWidth } from "./utils.ts";
