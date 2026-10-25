@@ -768,6 +768,59 @@ async function run() {
 		cmdLines.length = 0;
 		await commands.get("auto-router").handler("memory", cmdCtx);
 		assert.ok(cmdLines.some((line) => line.includes("absent")), "reports an empty store");
+
+		// /auto-router set / add / remove subcommands
+		cmdLines.length = 0;
+		await commands.get("auto-router").handler("set flash=provA/flash1,provA/flash2 pro=provA/pro1,provA/pro2", cmdCtx);
+		assert.ok(cmdLines.some((line) => line.includes("Saved") && line.includes("flash1, provA/flash2")));
+
+		// set only flash: pro is preserved
+		cmdLines.length = 0;
+		await commands.get("auto-router").handler("set flash=provA/flashOnly", cmdCtx);
+		assert.ok(cmdLines.some((line) => line.includes("flash = provA/flashOnly") && line.includes("pro1, provA/pro2")));
+
+		// add to pro tier
+		cmdLines.length = 0;
+		await commands.get("auto-router").handler("add pro provA/pro3", cmdCtx);
+		assert.ok(cmdLines.some((line) => line.includes("pro3")));
+
+		// remove from pro tier
+		cmdLines.length = 0;
+		await commands.get("auto-router").handler("remove pro provA/pro3", cmdCtx);
+		assert.ok(cmdLines.some((line) => !line.includes("pro3")));
+
+		// interactive wizard using custom UI (promptMultiSelect)
+		let wizardCalls = 0;
+		const wizardCtx: any = {
+			hasUI: true,
+			mode: "tui",
+			modelRegistry: {
+				getAvailableOfType: async () => [
+					{ provider: "provA", id: "f1" },
+					{ provider: "provA", id: "f2" },
+					{ provider: "provA", id: "p1" },
+					{ provider: "provA", id: "p2" },
+				],
+			},
+			ui: {
+				custom: async (factory: any) => {
+					wizardCalls++;
+					const fakeTui = { requestRender: () => {} };
+					const fakeTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+					const fakeKb = { matches: () => false };
+					return new Promise((resolve) => {
+						const component = factory(fakeTui, fakeTheme, fakeKb, (val: any) => resolve(val));
+						// Press space to toggle, then enter to confirm
+						component.handleInput(" ");
+						component.handleInput("\r");
+					});
+				},
+				notify: () => {},
+			},
+			reload: async () => {},
+		};
+		await commands.get("auto-router").handler("", wizardCtx);
+		assert.equal(wizardCalls, 2, "wizard invokes multi-select dialog for both flash and pro");
 	} finally {
 		console.log = origLog;
 	}

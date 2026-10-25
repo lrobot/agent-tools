@@ -128,11 +128,13 @@ Create or change it with the built-in wizard:
 
 | command | effect |
 |---|---|
-| `/auto-router` | interactive: pick the primary of each tier from the models Pi can reach |
+| `/auto-router` | interactive multi-select: toggle/order failover models for each tier using space/arrows |
 | `/auto-router status` | show config path, both tier lists (with `ok` / `no-auth` / `missing` marks), whether the pair resolves, current default |
 | `/auto-router memory` | show the decision store: path, size, ring fill, session reuse, recent verdicts |
 | `/auto-router memory reset` | wipe the store — it rebuilds itself from new verdicts |
-| `/auto-router set flash=<id>[,<id>...] pro=<id>[,<id>...]` | write comma-separated failover lists and reload |
+| `/auto-router set [flash=<id>...] [pro=<id>...]` | set one or both tiers with comma-separated failover lists |
+| `/auto-router add flash\|pro <id>` | append a model to the tier's failover list |
+| `/auto-router remove flash\|pro <id>` | remove a model from the tier's failover list |
 
 The wizard writes only its own file. **`models.json` is never touched** — availability is read from Pi's live model registry — and the only value read from `settings.json` is your default model id, used to warn you when it changes.
 

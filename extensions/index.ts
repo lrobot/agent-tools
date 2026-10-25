@@ -50,6 +50,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSy
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promptMultiSelect } from "pi-tui-multiselect-list";
 import { parse as parseToml } from "smol-toml";
 import type { Message } from "@earendil-works/pi-ai";
 import type {
@@ -1516,26 +1517,70 @@ export default function (pi: ExtensionAPI) {
 						.split(",")
 						.map((s) => s.trim())
 						.filter(Boolean);
-				const flashModels = parseList("flash");
-				const proModels = parseList("pro");
+				const hasFlash = parts.some((part) => part.startsWith("flash="));
+				const hasPro = parts.some((part) => part.startsWith("pro="));
+				const current = readRoles();
+				const flashModels = hasFlash ? parseList("flash") : current.flash.map((r) => `${r.provider}/${r.id}`);
+				const proModels = hasPro ? parseList("pro") : current.pro.map((r) => `${r.provider}/${r.id}`);
 				const invalid = { provider: "", id: "" };
 				const valid = (list: string[]) =>
 					list.length > 0 && list.every((s) => parseRole(s, invalid).provider !== "");
 				if (!valid(flashModels) || !valid(proModels)) {
-					say("usage: /auto-router set flash=<provider/model-id>[,<id>...] pro=<provider/model-id>[,<id>...]", "warning");
+					say("usage: /auto-router set [flash=<provider/model-id>[,<id>...]] [pro=<provider/model-id>[,<id>...]]", "warning");
 					return;
 				}
 				if (save(flashModels, proModels)) await ctx.reload();
 				return;
 			}
 
-			if (sub) {
-				say("usage: /auto-router | /auto-router status | /auto-router memory [reset] | /auto-router set flash=<id>[,<id>...] pro=<id>[,<id>...]", "warning");
+			if (sub === "add") {
+				const tier = parts[1];
+				const model = parts[2];
+				const invalid = { provider: "", id: "" };
+				if ((tier !== "flash" && tier !== "pro") || !model || parseRole(model, invalid).provider === "") {
+					say("usage: /auto-router add flash|pro <provider/model-id>", "warning");
+					return;
+				}
+				const current = readRoles();
+				const flashList = current.flash.map((r) => `${r.provider}/${r.id}`);
+				const proList = current.pro.map((r) => `${r.provider}/${r.id}`);
+				const targetList = tier === "flash" ? flashList : proList;
+				if (!targetList.includes(model)) targetList.push(model);
+				if (save(flashList, proList)) await ctx.reload();
 				return;
 			}
 
-			// Interactive wizard: pick the primary of each tier from the models Pi
-			// can reach; failover entries are added via /auto-router set or the TOML.
+			if (sub === "remove" || sub === "rm") {
+				const tier = parts[1];
+				const model = parts[2];
+				if ((tier !== "flash" && tier !== "pro") || !model) {
+					say("usage: /auto-router remove flash|pro <provider/model-id>", "warning");
+					return;
+				}
+				const current = readRoles();
+				const flashList = current.flash.map((r) => `${r.provider}/${r.id}`);
+				const proList = current.pro.map((r) => `${r.provider}/${r.id}`);
+				const targetList = tier === "flash" ? flashList : proList;
+				const idx = targetList.indexOf(model);
+				if (idx < 0) {
+					say(`Model ${model} is not in the ${tier} tier list.`, "warning");
+					return;
+				}
+				if (targetList.length <= 1) {
+					say(`Cannot remove ${model}: ${tier} tier must have at least one model.`, "warning");
+					return;
+				}
+				targetList.splice(idx, 1);
+				if (save(flashList, proList)) await ctx.reload();
+				return;
+			}
+
+			if (sub) {
+				say("usage: /auto-router | /auto-router status | /auto-router memory [reset] | /auto-router set flash=<id>... pro=<id>... | /auto-router add flash|pro <id> | /auto-router remove flash|pro <id>", "warning");
+				return;
+			}
+
+			// Interactive wizard: use promptMultiSelect to pick ordered failover lists
 			if (!ctx.hasUI || ctx.mode !== "tui") {
 				for (const line of status()) say(line);
 				say("usage: /auto-router status | /auto-router memory [reset] | /auto-router set flash=<provider/model-id>[,<id>...] pro=<provider/model-id>[,<id>...]");
@@ -1548,11 +1593,28 @@ export default function (pi: ExtensionAPI) {
 				say("No authenticated chat models available to choose from.", "warning");
 				return;
 			}
-			const flashModel = await ctx.ui.select("flash model (cheap default; also rates each issue)", candidates);
-			if (!flashModel) return;
-			const proModel = await ctx.ui.select("pro model (strong escalation target)", candidates);
-			if (!proModel) return;
-			if (save([flashModel], [proModel])) await ctx.reload();
+
+			const current = readRoles();
+			const currentFlash = current.flash.map((r) => `${r.provider}/${r.id}`);
+			const currentPro = current.pro.map((r) => `${r.provider}/${r.id}`);
+
+			const chosenFlash = await promptMultiSelect(ctx, {
+				title: "Configure Flash Tier Backends (Ordered by Failover Priority)",
+				items: candidates,
+				initialSelected: currentFlash.filter((id) => candidates.includes(id)),
+				mode: "ordered",
+			});
+			if (!chosenFlash || chosenFlash.length === 0) return;
+
+			const chosenPro = await promptMultiSelect(ctx, {
+				title: "Configure Pro Tier Backends (Ordered by Failover Priority)",
+				items: candidates,
+				initialSelected: currentPro.filter((id) => candidates.includes(id)),
+				mode: "ordered",
+			});
+			if (!chosenPro || chosenPro.length === 0) return;
+
+			if (save(chosenFlash, chosenPro)) await ctx.reload();
 		},
 	});
 
