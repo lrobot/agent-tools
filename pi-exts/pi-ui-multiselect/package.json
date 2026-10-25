@@ -1,0 +1,47 @@
+{
+  "name": "pi-tui-multiselect-list",
+  "version": "0.1.0",
+  "description": "Interactive multi-select list component for Pi terminal UI with ordered failover ranking and checkbox support",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "tui",
+    "terminal",
+    "multiselect",
+    "select-list"
+  ],
+  "author": "lrobot",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lrobot/pi-tui-multiselect-list.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lrobot/pi-tui-multiselect-list/issues"
+  },
+  "homepage": "https://github.com/lrobot/pi-tui-multiselect-list#readme",
+  "scripts": {
+    "test": "node --test test/multi-select.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  }
+}
