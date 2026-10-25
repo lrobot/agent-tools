@@ -42,6 +42,9 @@ prompt arrives (before_agent_start)
 
 - **One prompt, one decision** — the next prompt re-decides, so a hard task can escalate without
   locking the whole session to pro.
+- **Failover inside a tier** — each tier's list is tried in order: a failed request (a retry)
+  moves to the next credentialed backend of the same tier and stays there for the run; an
+  exhausted tier fails the turn rather than degrading to the other tier.
 - **Local first**: routine and obviously hard prompts never reach a model. `/auto-router status`
   reports how often the local layer decided on its own. Signals cover **English and Chinese**
   (stack traces are language-neutral), and the scan looks at the first 32 KB only — a 1 MB paste
@@ -84,37 +87,52 @@ The extension owns its config, **next to the extension file** — so uninstallin
 extension takes its config with it:
 
 ```
-<install-dir>/extensions/auto-router.json
+<install-dir>/extensions/auto-router.toml
 ```
 
 | install method | config path |
 |---|---|
-| plain file | `~/.pi/agent/extensions/auto-router.json` |
-| `pi install npm:` | `~/.pi/agent/npm/node_modules/pi-tier-router/extensions/auto-router.json` |
-| `pi install git:` | `~/.pi/agent/git/github.com/rioliu/pi-tier-router/extensions/auto-router.json` |
+| plain file | `~/.pi/agent/extensions/auto-router.toml` |
+| `pi install npm:` | `~/.pi/agent/npm/node_modules/pi-tier-router/extensions/auto-router.toml` |
+| `pi install git:` | `~/.pi/agent/git/github.com/rioliu/pi-tier-router/extensions/auto-router.toml` |
 
 `pi update` preserves the file — verified for both npm and git sources. If an older copy is
 sitting in `~/.pi/agent/extensions/`, it is read and **moved next to the extension the first time
-it loads**, so uninstalling leaves nothing behind.
+it loads**, so uninstalling leaves nothing behind. A pre-TOML `auto-router.json` from an older
+release is migrated automatically (each single model becomes a one-entry failover list).
 
-```json
-{
-  "flash-model": "deepseek/deepseek-v4-flash",
-  "pro-model":   "deepseek/deepseek-v4-pro"
-}
+```toml
+[tier.flash]
+models = [
+  "deepseek/deepseek-v4-flash",
+  "openai/gpt-4o-mini",
+]
+
+[tier.pro]
+models = [
+  "deepseek/deepseek-v4-pro",
+  "anthropic/claude-sonnet-4-5",
+]
 ```
 
-Values are `provider/model-id` (split on the **first** slash, so ids containing slashes work, e.g. `openrouter/typesafe/jev-1.13`). The two roles may live on different providers. Omitted or malformed keys fall back to a MiMo pair.
+Each tier is an **ordered failover list** of `provider/model-id` values (split on the
+**first** slash, so ids containing slashes work, e.g. `openrouter/typesafe/jev-1.13`).
+The first entry with valid credentials is the primary; later entries are used only when
+a request on an earlier entry fails (a retry): the router advances to the next
+credentialed model **within the same tier** and stays on it for the rest of the run, so
+the prompt cache stays warm. Entries without credentials are skipped. When a tier's
+list is exhausted the turn fails — pro never silently degrades to flash. Tiers may mix
+providers freely. Omitted or malformed tiers fall back to a MiMo pair.
 
 Create or change it with the built-in wizard:
 
 | command | effect |
 |---|---|
-| `/auto-router` | interactive: pick both roles from the models Pi can reach |
-| `/auto-router status` | show config path, both roles, whether the pair resolves, current default |
+| `/auto-router` | interactive: pick the primary of each tier from the models Pi can reach |
+| `/auto-router status` | show config path, both tier lists (with `ok` / `no-auth` / `missing` marks), whether the pair resolves, current default |
 | `/auto-router memory` | show the decision store: path, size, ring fill, session reuse, recent verdicts |
 | `/auto-router memory reset` | wipe the store — it rebuilds itself from new verdicts |
-| `/auto-router set flash=<provider/id> pro=<provider/id>` | write the config and reload |
+| `/auto-router set flash=<id>[,<id>...] pro=<id>[,<id>...]` | write comma-separated failover lists and reload |
 
 The wizard writes only its own file. **`models.json` is never touched** — availability is read from Pi's live model registry — and the only value read from `settings.json` is your default model id, used to warn you when it changes.
 
@@ -137,6 +155,12 @@ Issues are announced when they appear, not on every prompt.
 AUTO_ROUTER_DEBUG=1 pi
 [auto-router] roles flash=... pro=...
 [auto-router] local pro conf=0.93 via concurrency
+```
+
+A failover prints one line as it happens:
+
+```
+[auto-router] failover pro: deepseek/deepseek-v4-pro -> anthropic/claude-sonnet-4-5
 ```
 
 Local decisions print a single line and cost nothing. Only an abstain reaches the store or the

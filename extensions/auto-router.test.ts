@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,6 +11,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = mkdtempSync(path.join(os.tmpdir(), "auto-router-root-"));
 mkdirSync(path.join(root, "extensions"));
 const REAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
+// The copied extension imports smol-toml, and Node resolves packages from the
+// importing file's directory upward: link the repo's node_modules into the
+// temp root so both the extension copy and the package copy can reach it.
+symlinkSync(path.join(path.dirname(REAL), "..", "node_modules"), path.join(root, "node_modules"), "dir");
 const COPY = path.join(root, "extensions", "index.ts");
 copyFileSync(REAL, COPY);
 writeFileSync(path.join(root, "settings.json"), JSON.stringify({ defaultProvider: "router", defaultModel: "auto" }));
@@ -27,17 +31,35 @@ const PKG_COPY = path.join(PKG_EXTENSIONS, "index.ts");
 copyFileSync(COPY, PKG_COPY);
 const pkgMod = await import(pathToFileURL(PKG_COPY).href);
 
-const CONFIG = path.join(root, "extensions", "auto-router.json");
+const CONFIG = path.join(root, "extensions", "auto-router.toml");
 const FALLBACK = { provider: "cc-switch-xiaomi-mi-mo-token-plan-china", id: "mimo-v2.6-flash" };
 const MIMO = FALLBACK.provider;
 
-const ownConfig = (value: Record<string, unknown> | null) =>
-	value === null ? rmSync(CONFIG, { force: true }) : writeFileSync(CONFIG, JSON.stringify(value));
+const tomlConfig = (flash: string | string[], pro: string | string[]): string => {
+	const list = (items: string[]) => items.map((s) => `  "${s}",`).join("\n");
+	return (
+		`[tier.flash]\nmodels = [\n${list(Array.isArray(flash) ? flash : [flash])}\n]\n\n` +
+		`[tier.pro]\nmodels = [\n${list(Array.isArray(pro) ? pro : [pro])}\n]\n`
+	);
+};
 
-function registry(models: { provider: string; id: string }[]) {
+const ownConfig = (value: { flash: string | string[]; pro: string | string[] } | null) => {
+	if (value === null) rmSync(CONFIG, { force: true });
+	else writeFileSync(CONFIG, tomlConfig(value.flash, value.pro));
+};
+
+/** Written config with its comment header stripped, for byte-equal checks. */
+const tomlBody = (file: string): string =>
+	readFileSync(file, "utf8")
+		.split("\n")
+		.filter((line) => !line.startsWith("#"))
+		.join("\n");
+
+function registry(models: { provider: string; id: string }[], noAuth?: Set<string>) {
 	return {
 		find: (provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id),
-		hasConfiguredAuth: () => true,
+		hasConfiguredAuth: (m: { provider: string; id: string }) =>
+			noAuth ? !noAuth.has(`${m.provider}/${m.id}`) : true,
 		// Nothing in these tests may reach a model: the rating chain must
 		// treat this as "rater unavailable" and fall through.
 		complete: async () => {
@@ -88,7 +110,7 @@ async function run() {
 
 	// C. own config present and pair resolvable -> silent; roles re-read from
 	//    the extension dir without a restart
-	ownConfig({ "flash-model": "deepseek/deepseek-v4-flash", "pro-model": "deepseek/deepseek-v4-pro" });
+	ownConfig({ flash: "deepseek/deepseek-v4-flash", pro: "deepseek/deepseek-v4-pro" });
 	({ calls, ctx } = collector(deepseekPair));
 	checkConfig(ctx);
 	assert.equal(calls.length, 0, "configured pair found -> no warnings");
@@ -108,16 +130,28 @@ async function run() {
 	checkConfig(ctx);
 	assert.equal(calls.length, 1, "issue re-announced after being cleared");
 
-	// writeOwnConfig: wizard persistence, in the extension dir only
+	// writeOwnConfig: wizard persistence, in the extension dir only, as TOML
 	ownConfig(null);
-	const written = writeOwnConfig("provB/flashB", "provB/proB");
+	const written = writeOwnConfig(["provB/flashB"], ["provB/proB"]);
 	assert.ok(written, "config is written next to the extension file");
 	// /var is a symlink to /private/var on macOS; compare real paths.
 	assert.equal(realpathSync(written), realpathSync(CONFIG), "config path must be the extension dir");
-	assert.deepEqual(JSON.parse(readFileSync(CONFIG, "utf8")), {
-		"flash-model": "provB/flashB",
-		"pro-model": "provB/proB",
-	});
+	assert.equal(
+		tomlBody(CONFIG),
+		tomlConfig("provB/flashB", "provB/proB"),
+		"config is TOML with one tier entry per role",
+	);
+	// writeOwnConfig also accepts multi-entry failover lists
+	writeOwnConfig(["provB/flashB", "provB/flashB2"], ["provB/proB"]);
+	assert.equal(
+		tomlBody(CONFIG),
+		tomlConfig(["provB/flashB", "provB/flashB2"], "provB/proB"),
+		"failover lists persist in order",
+	);
+	// ...and supersede a stranded legacy JSON copy
+	writeFileSync(path.join(root, "extensions", "auto-router.json"), JSON.stringify({ "flash-model": "x/y", "pro-model": "z/w" }));
+	writeOwnConfig(["provB/flashB"], ["provB/proB"]);
+	assert.ok(!existsSync(path.join(root, "extensions", "auto-router.json")), "legacy JSON superseded by a TOML save");
 	// roles refresh immediately (no restart): the provB pair now resolves
 	const provBPair = registry([
 		{ provider: "provB", id: "flashB" },
@@ -139,10 +173,10 @@ async function run() {
 
 	// a package install keeps its config next to its own code, so uninstalling
 	// the extension takes the config with it
-	const pkgWritten = pkgMod.writeOwnConfig("provC/flashC", "provC/proC");
+	const pkgWritten = pkgMod.writeOwnConfig(["provC/flashC"], ["provC/proC"]);
 	assert.equal(
 		realpathSync(pkgWritten),
-		realpathSync(path.join(PKG_EXTENSIONS, "auto-router.json")),
+		realpathSync(path.join(PKG_EXTENSIONS, "auto-router.toml")),
 		"package installs keep config next to the extension file",
 	);
 	assert.ok(
@@ -153,9 +187,9 @@ async function run() {
 
 	// ...and when only that older copy exists, the package install still reads it
 	// (restore the default first so no unrelated default-change info muddies this)
-	rmSync(path.join(PKG_EXTENSIONS, "auto-router.json"), { force: true });
+	rmSync(path.join(PKG_EXTENSIONS, "auto-router.toml"), { force: true });
 	writeSettings({ defaultProvider: "router", defaultModel: "auto" });
-	writeFileSync(CONFIG, JSON.stringify({ "flash-model": "provL/flashL", "pro-model": "provL/proL" }));
+	writeFileSync(CONFIG, tomlConfig("provL/flashL", "provL/proL"));
 	const provLPair = registry([
 		{ provider: "provL", id: "flashL" },
 		{ provider: "provL", id: "proL" },
@@ -174,14 +208,31 @@ async function run() {
 	assert.ok(moved, "migration reports the new location");
 	assert.equal(
 		realpathSync(moved),
-		realpathSync(path.join(PKG_EXTENSIONS, "auto-router.json")),
+		realpathSync(path.join(PKG_EXTENSIONS, "auto-router.toml")),
 		"legacy config moved next to the extension file",
 	);
 	assert.ok(!existsSync(CONFIG), "and the old copy is gone");
-	assert.deepEqual(JSON.parse(readFileSync(path.join(PKG_EXTENSIONS, "auto-router.json"), "utf8")), {
-		"flash-model": "provL/flashL",
-		"pro-model": "provL/proL",
-	}, "the moved config keeps its contents");
+	assert.equal(
+		tomlBody(path.join(PKG_EXTENSIONS, "auto-router.toml")),
+		tomlConfig("provL/flashL", "provL/proL"),
+		"the moved config keeps its contents",
+	);
+
+	// a pre-TOML JSON config (from an older release) migrates to TOML on load,
+	// each single model becoming a one-entry failover list
+	rmSync(path.join(PKG_EXTENSIONS, "auto-router.toml"), { force: true });
+	writeFileSync(
+		path.join(PKG_EXTENSIONS, "auto-router.json"),
+		JSON.stringify({ "flash-model": "provJ/flashJ", "pro-model": "provJ/proJ" }),
+	);
+	const jsonMoved = pkgMod.migrateLegacyConfig();
+	assert.ok(jsonMoved, "JSON migration reports the new location");
+	assert.ok(!existsSync(path.join(PKG_EXTENSIONS, "auto-router.json")), "the JSON copy is removed");
+	assert.equal(
+		tomlBody(path.join(PKG_EXTENSIONS, "auto-router.toml")),
+		tomlConfig("provJ/flashJ", "provJ/proJ"),
+		"JSON values survive as single-entry TOML tiers",
+	);
 
 	// chooseRating chain ------------------------------------------------------
 	let counter = { self: 0, jev: 0 };
@@ -406,7 +457,7 @@ async function run() {
 	assert.ok(bigDecision.signals.includes("big-context") && bigDecision.signals.includes("multi-file"));
 
 	// before_agent_start -> route(): one prompt, one decision -------------------
-	ownConfig({ "flash-model": `${MIMO}/mimo-v2.6-flash`, "pro-model": `${MIMO}/mimo-v2.6-pro` });
+	ownConfig({ flash: `${MIMO}/mimo-v2.6-flash`, pro: `${MIMO}/mimo-v2.6-pro` });
 	const handlers = new Map<string, any>();
 	const commands = new Map<string, any>();
 	let routed: any;
@@ -479,6 +530,100 @@ async function run() {
 	fire("agent_end");
 	fire("before_agent_start", { prompt: "hi" }, { ...wireCtx, model: { provider: MIMO, id: "mimo-v2.6-flash" } });
 	assert.equal(stats.prompts, 3, "prompts for another model are not counted");
+
+	// ---- failover: a retry advances within the failing model's tier ----
+	ownConfig(
+		{
+			flash: [`${MIMO}/mimo-v2.6-flash`, `openai/gpt-4o-mini`, `deepseek/deepseek-v4-flash`],
+			pro: [`${MIMO}/mimo-v2.6-pro`, `anthropic/claude-sonnet-4-5`],
+		},
+	);
+	// re-read the roles the way session_start does (refreshRoles via checkConfig)
+	const foRefresh = collector(registry([
+		{ provider: MIMO, id: "mimo-v2.6-flash" },
+		{ provider: MIMO, id: "mimo-v2.6-pro" },
+		{ provider: "openai", id: "gpt-4o-mini" },
+		{ provider: "deepseek", id: "deepseek-v4-flash" },
+		{ provider: "anthropic", id: "claude-sonnet-4-5" },
+	]));
+	checkConfig(foRefresh.ctx);
+	const foReg = registry([
+		{ provider: MIMO, id: "mimo-v2.6-flash" },
+		{ provider: MIMO, id: "mimo-v2.6-pro" },
+		{ provider: "openai", id: "gpt-4o-mini" },
+		{ provider: "deepseek", id: "deepseek-v4-flash" },
+		{ provider: "anthropic", id: "claude-sonnet-4-5" },
+	]);
+	const foCtx: any = { ...wireCtx, modelRegistry: foReg };
+	const retryReq = (failed: { provider: string; id: string }) => ({
+		reason: "retry",
+		messages: userReq("hi").messages,
+		thinkingLevel: "medium",
+		state: undefined,
+		previous: undefined,
+		signal: undefined,
+		failed: { model: failed, thinkingLevel: "medium", message: { role: "assistant", content: "" } },
+	});
+
+	// flash primary fails -> flash[1]; offset recorded in the branch state
+	let fo = await routed(retryReq({ provider: MIMO, id: "mimo-v2.6-flash" }), foCtx);
+	assert.equal(modelOf(fo), "openai/gpt-4o-mini", "flash failure fails over to the next flash entry");
+	assert.equal(fo.state.rated, "flash");
+	assert.equal(fo.state.source, "failover");
+	assert.equal(fo.state.offset, 1);
+	assert.equal(stats.failover, 1);
+
+	// the failed-over model fails in turn -> deepseek entry has no auth, so it
+	// is skipped: the tier is exhausted -> the turn fails
+	const foNoAuth = registry(
+		[
+			{ provider: MIMO, id: "mimo-v2.6-flash" },
+			{ provider: MIMO, id: "mimo-v2.6-pro" },
+			{ provider: "openai", id: "gpt-4o-mini" },
+			{ provider: "deepseek", id: "deepseek-v4-flash" },
+			{ provider: "anthropic", id: "claude-sonnet-4-5" },
+		],
+		new Set(["deepseek/deepseek-v4-flash"]),
+	);
+	await assert.rejects(
+		routed(retryReq({ provider: "openai", id: "gpt-4o-mini" }), { ...foCtx, modelRegistry: foNoAuth }),
+		(e: any) => /flash tier exhausted/.test(e?.message),
+		"a no-auth entry is skipped; exhausted flash tier stops the turn",
+	);
+
+	// pro tier exhausted -> the turn fails; pro NEVER degrades to flash
+	await assert.rejects(
+		routed(retryReq({ provider: "anthropic", id: "claude-sonnet-4-5" }), foCtx),
+		(e: any) => /pro tier exhausted/.test(e?.message),
+		"pro failure must stop, not degrade to flash",
+	);
+	// ...but the first pro entry failing does fail over to the second
+	fo = await routed(retryReq({ provider: MIMO, id: "mimo-v2.6-pro" }), foCtx);
+	assert.equal(modelOf(fo), "anthropic/claude-sonnet-4-5", "pro failure fails over within the pro tier");
+	assert.equal(fo.state.offset, 1);
+
+	// a failed model that belongs to neither tier is routed normally
+	fire("agent_end");
+	fire("before_agent_start", { prompt: "hi" }, foCtx);
+	const foreign = await routed(retryReq({ provider: "somewhere", id: "else" }), foCtx);
+	assert.equal(modelOf(foreign), `${MIMO}/mimo-v2.6-flash`, "foreign failure keeps the local decision");
+
+	// continuations after a failover keep the failed-over model (state.offset)
+	const afterFailover = await routed(
+		{ ...userReq("tool result", "continuation"), state: { rated: "flash", source: "failover", offset: 1 } },
+		foCtx,
+	);
+	assert.equal(modelOf(afterFailover), "openai/gpt-4o-mini", "continuation stays on the failed-over model");
+	assert.equal(afterFailover.state.offset, 1, "the offset is carried into the continuation");
+
+	// restore single-entry roles for the sections that follow
+	ownConfig({ flash: `${MIMO}/mimo-v2.6-flash`, pro: `${MIMO}/mimo-v2.6-pro` });
+	const restoreRefresh = collector(registry([
+		{ provider: MIMO, id: "mimo-v2.6-flash" },
+		{ provider: MIMO, id: "mimo-v2.6-pro" },
+	]));
+	checkConfig(restoreRefresh.ctx);
+	wireCtx.modelRegistry = mimoReg;
 
 	// ---- the decision store: chain verdicts become reusable examples ----
 	const MEMORY_PATH = path.join(root, "extensions", "auto-router-memory.jsonl");

@@ -1,7 +1,9 @@
 /**
- * auto-router - a virtual model that routes between a configured flash model
- * (cheap default) and pro model (strong escalation) by the difficulty of the
- * issue. Family-agnostic: both roles come from settings.json.
+ * auto-router - a virtual model that routes between a configured flash tier
+ * (cheap default) and pro tier (strong escalation) by the difficulty of the
+ * issue. Family-agnostic: each tier is an ordered failover list of
+ * provider/model-id entries from this extension's own TOML config; the first
+ * credentialed entry serves, and a failed request retries on the next entry.
  *
  * Decision chain (mirrors Claude Code's haiku/sonnet/opus tiering, with a
  * local layer first and the decision taken per prompt):
@@ -48,6 +50,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSy
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseToml } from "smol-toml";
 import type { Message } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -57,19 +60,24 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 /**
- * Which registered model plays each role. The extension owns its config and it
- * lives next to the extension file - created and edited with /auto-router,
- * removed together with the extension, read lazily while it is loaded and
- * ignored when it is not:
+ * Which registered models play each role: an ordered failover list per tier.
+ * The first entry with valid credentials is the primary; later entries are
+ * used only when a request on an earlier one fails. The extension owns its
+ * config (TOML) and it lives next to the extension file - created and edited
+ * with /auto-router, removed together with the extension, read lazily while
+ * it is loaded and ignored when it is not:
  *
- *   ~/.pi/agent/extensions/auto-router.json
- *   { "flash-model": "deepseek/deepseek-v4-flash",
- *     "pro-model":   "deepseek/deepseek-v4-pro" }
+ *   ~/.pi/agent/extensions/auto-router.toml
+ *   [tier.flash]
+ *   models = ["deepseek/deepseek-v4-flash", "openai/gpt-4o-mini"]
+ *   [tier.pro]
+ *   models = ["deepseek/deepseek-v4-pro", "anthropic/claude-sonnet-4-5"]
  *
  * Pi's files stay Pi's: the only value read from settings.json is the default
  * model id (to warn when it changes), and models.json is never touched -
- * availability comes from the live model registry. Missing or malformed keys
- * keep the MiMo defaults, and the two roles may live on different providers.
+ * availability comes from the live model registry. Tiers with no valid entry
+ * keep the MiMo defaults, and the two tiers may mix providers freely. A
+ * pre-TOML auto-router.json is migrated on load.
  */
 interface Role {
 	provider: string;
@@ -104,8 +112,10 @@ export function parseRole(value: unknown, fallback: Role): Role {
 	return { provider: value.slice(0, slash), id: value.slice(slash + 1) };
 }
 
-/** Extension-owned config file; Pi's settings.json is only ever read. */
-const CONFIG_FILE = "auto-router.json";
+/** Extension-owned config file (TOML); Pi's settings.json is only ever read. */
+const CONFIG_FILE = "auto-router.toml";
+/** Pre-TOML config name; migrated to TOML on load. */
+const LEGACY_JSON = "auto-router.json";
 
 /** Directory holding this extension file. */
 const EXTENSION_DIR = ((): string | undefined => {
@@ -149,51 +159,139 @@ function configFile(): string {
 	return path.join(configDir(), CONFIG_FILE);
 }
 
-function readOwnConfig(): Record<string, unknown> | undefined {
-	const own = readJson(configFile());
-	if (own) return own;
-	const legacy = legacyConfigFile();
-	return samePath(legacy, configFile()) ? undefined : readJson(legacy);
+function readToml(file: string): Record<string, unknown> | undefined {
+	try {
+		return parseToml(readFileSync(file, "utf8")) as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
 }
 
-/** Write the extension's config; returns the path written. */
-export function writeOwnConfig(flashModel: string, proModel: string): string {
+function jsonConfigFileIn(dir: string): string {
+	return path.join(dir, LEGACY_JSON);
+}
+
+function legacyJsonFile(): string {
+	return path.join(agentDir(), "extensions", LEGACY_JSON);
+}
+
+/** Read the extension's config: own TOML first, then the older agent-dir
+ * TOML, then either location's legacy JSON (reachable only when the load-time
+ * migration could not write, e.g. a read-only install dir). */
+function readOwnConfig(): Record<string, unknown> | undefined {
+	const own = readToml(configFile());
+	if (own) return own;
+	const legacy = legacyConfigFile();
+	if (!samePath(legacy, configFile())) {
+		const moved = readToml(legacy);
+		if (moved) return moved;
+	}
+	const ownJson = jsonConfigFileIn(configDir());
+	const legacyJson = legacyJsonFile();
+	const fromOwnJson = readJson(ownJson);
+	if (fromOwnJson) return fromOwnJson;
+	return samePath(legacyJson, ownJson) ? undefined : readJson(legacyJson);
+}
+
+/** Raw "provider/model-id" strings configured for a tier, accepting both the
+ * TOML shape ([tier.<name>].models) and the legacy JSON shape ("<name>-model"). */
+function roleStrings(own: Record<string, unknown> | undefined, tier: "flash" | "pro"): string[] {
+	const tiers = own?.tier;
+	const section =
+		typeof tiers === "object" && tiers !== null
+			? (tiers as Record<string, unknown>)[tier]
+			: undefined;
+	const list =
+		typeof section === "object" && section !== null
+			? (section as Record<string, unknown>).models
+			: undefined;
+	if (Array.isArray(list)) return list.filter((s): s is string => typeof s === "string");
+	const single = own?.[`${tier}-model`];
+	return typeof single === "string" ? [single] : [];
+}
+
+/** Serialize the config as TOML. The shape is fixed, so a template suffices -
+ * no serializer dependency. JSON.stringify quoting is a valid TOML basic
+ * string for these values. */
+function tomlConfig(flash: string[], pro: string[]): string {
+	const list = (items: string[]) => items.map((s) => `  ${JSON.stringify(s)},`).join("\n");
+	return (
+		"# auto-router config: two tiers, each an ordered failover list.\n" +
+		"# The first entry with valid credentials is the primary; later entries are\n" +
+		"# failover candidates, used only when a request on an earlier one fails.\n" +
+		"[tier.flash]\nmodels = [\n" +
+		list(flash) +
+		"\n]\n\n" +
+		"[tier.pro]\nmodels = [\n" +
+		list(pro) +
+		"\n]\n"
+	);
+}
+
+/** Write the extension's config as TOML; returns the path written. */
+export function writeOwnConfig(flashModels: string[], proModels: string[]): string {
 	mkdirSync(configDir(), { recursive: true });
 	const file = configFile();
-	writeFileSync(file, `${JSON.stringify({ "flash-model": flashModel, "pro-model": proModel }, null, 2)}\n`);
-	// Supersede an older copy so uninstalling never leaves it stranded - but only
-	// when it really is a different file, never when a symlink makes the paths
-	// look different while pointing at the same file.
-	const legacy = legacyConfigFile();
-	if (existsSync(legacy) && !samePath(legacy, file)) rmSync(legacy);
+	writeFileSync(file, tomlConfig(flashModels, proModels));
+	// Supersede older copies so uninstalling never leaves one stranded - but
+	// only when it really is a different file, never when a symlink makes the
+	// paths look different while pointing at the same file.
+	for (const old of [legacyConfigFile(), jsonConfigFileIn(configDir()), legacyJsonFile()]) {
+		if (existsSync(old) && !samePath(old, file)) rmSync(old);
+	}
 	refreshRoles();
 	return file;
 }
 
-function readRoles(): { flash: Role; pro: Role } {
+/** Parse one tier's configured strings into Roles, dropping malformed
+ * entries; an empty result keeps the default for that tier. */
+function parseRoleList(own: Record<string, unknown> | undefined, tier: "flash" | "pro", fallback: Role): Role[] {
+	const invalid: Role = { provider: "", id: "" };
+	const parsed = roleStrings(own, tier)
+		.map((s) => parseRole(s, invalid))
+		.filter((r) => r.provider !== "");
+	return parsed.length > 0 ? parsed : [fallback];
+}
+
+function readRoles(): { flash: Role[]; pro: Role[] } {
 	const own = readOwnConfig();
 	return {
-		flash: parseRole(own?.["flash-model"], DEFAULT_FLASH),
-		pro: parseRole(own?.["pro-model"], DEFAULT_PRO),
+		flash: parseRoleList(own, "flash", DEFAULT_FLASH),
+		pro: parseRoleList(own, "pro", DEFAULT_PRO),
 	};
 }
 
 /**
- * Move an older <agent-dir>/extensions config next to the extension file as
- * soon as this extension loads, so that uninstalling the extension leaves
- * nothing behind. Idempotent; for a file install both paths are the same file,
- * so there is nothing to move. Exported for tests.
+ * Migrate older config forms next to the extension file as soon as this
+ * extension loads, so uninstalling the extension leaves nothing behind:
+ * legacy JSON becomes TOML (each single model a one-entry failover list),
+ * and an agent-dir TOML moves next to the code. Idempotent; for a file
+ * install the source and target are the same file, so nothing moves.
+ * Exported for tests.
  */
 export function migrateLegacyConfig(): string | undefined {
-	const legacy = legacyConfigFile();
-	if (!existsSync(legacy)) return undefined;
 	const target = configFile();
-	if (samePath(legacy, target)) return undefined;
+	let migrated = false;
 	mkdirSync(configDir(), { recursive: true });
-	if (!existsSync(target)) writeFileSync(target, readFileSync(legacy, "utf8"));
-	rmSync(legacy);
-	debugRating(`config ready at ${target}`);
-	return target;
+	for (const json of [jsonConfigFileIn(configDir()), legacyJsonFile()]) {
+		if (!existsSync(json) || samePath(json, target)) continue;
+		const parsed = readJson(json);
+		if (parsed) {
+			if (!existsSync(target)) {
+				writeFileSync(target, tomlConfig(roleStrings(parsed, "flash"), roleStrings(parsed, "pro")));
+				migrated = true;
+			}
+			rmSync(json);
+		}
+	}
+	const legacy = legacyConfigFile();
+	if (existsSync(legacy) && !samePath(legacy, target)) {
+		if (!existsSync(target)) writeFileSync(target, readFileSync(legacy, "utf8"));
+		rmSync(legacy);
+		migrated = true;
+	}
+	if (migrated) debugRating(`config ready at ${target}`);
+	return migrated ? target : undefined;
 }
 
 // Migrate before the roles are read, so the moved config is the one in effect.
@@ -203,13 +301,11 @@ migrateLegacyConfig();
  * changes routing behavior without restarting Pi. */
 let ROLES = readRoles();
 
+const roleKey = (list: Role[]): string => list.map((r) => `${r.provider}/${r.id}`).join(",");
+
 function refreshRoles(): boolean {
 	const next = readRoles();
-	const changed =
-		next.flash.provider !== ROLES.flash.provider ||
-		next.flash.id !== ROLES.flash.id ||
-		next.pro.provider !== ROLES.pro.provider ||
-		next.pro.id !== ROLES.pro.id;
+	const changed = roleKey(next.flash) !== roleKey(ROLES.flash) || roleKey(next.pro) !== roleKey(ROLES.pro);
 	if (changed) ROLES = next;
 	return changed;
 }
@@ -233,8 +329,9 @@ function isRouterDefault(value: string | undefined): boolean {
 	return slash !== -1 && value.slice(0, slash) === VIRTUAL_PROVIDER && value.slice(slash + 1) === VIRTUAL_ID;
 }
 
-function isRole(model: { provider: string; id: string } | undefined, role: Role): boolean {
-	return model?.provider === role.provider && model.id === role.id;
+/** Does this physical model belong to the tier's failover list? */
+function isTier(model: { provider: string; id: string } | undefined, tier: Role[]): boolean {
+	return tier.some((role) => model?.provider === role.provider && model.id === role.id);
 }
 
 /** Where the virtual model is offered; unrelated to the physical providers. */
@@ -252,7 +349,7 @@ const PRO_THRESHOLD = 0.8;
 const RATING_PROMPT_CHARS = 6_000;
 
 type Difficulty = "flash" | "pro";
-type RatingSource = "local" | "memory" | "self" | "jev" | "keep";
+type RatingSource = "local" | "memory" | "self" | "jev" | "keep" | "failover";
 /** What the prompt-time hook recorded: a local decision, or "chain" when the
  * local layer abstained and the model-based chain must decide at request time. */
 
@@ -265,6 +362,9 @@ interface AutoState {
 	rated: Difficulty;
 	/** Which layer decided; absent when inherited from a previous turn. */
 	source?: RatingSource;
+	/** Index into the tier's failover list; 0/undefined = primary. Set by a
+	 * failover so the rest of the run keeps the failed-over model. */
+	offset?: number;
 }
 
 type AutoRequest = ModelRouteRequest<AutoState>;
@@ -527,6 +627,7 @@ export const stats = {
 	keep: 0,
 	direct: 0,
 	inherited: 0,
+	failover: 0,
 };
 
 function resetStats(): void {
@@ -854,23 +955,48 @@ export function queryMemory(profile: number, sketch: Uint32Array): MemoryHit | u
 	return { rated: pro > flash ? "pro" : "flash", hits: candidates.length, agree };
 }
 
+type Registry = ExtensionContext["modelRegistry"];
+
+type UsableModel = ReturnType<Registry["find"]>;
+
+/** First entry from index `start` that is in the catalog and has credentials. */
+function firstUsableFrom(
+	list: Role[],
+	start: number,
+	registry: Registry,
+): { role: Role; model: NonNullable<UsableModel>; idx: number } | undefined {
+	for (let i = Math.max(start, 0); i < list.length; i++) {
+		const model = registry.find(list[i].provider, list[i].id);
+		if (model && registry.hasConfiguredAuth(model)) return { role: list[i], model, idx: i };
+	}
+	return undefined;
+}
+
+/** First authenticated entry of the tier, from the top of the list. */
+function firstUsable(list: Role[], registry: Registry): NonNullable<UsableModel> | undefined {
+	return firstUsableFrom(list, 0, registry)?.model;
+}
+
 function routeTo(request: AutoRequest, ctx: ExtensionContext, rated: Difficulty, state?: AutoState): ModelRoute<AutoState> {
-	const role = rated === "pro" ? ROLES.pro : ROLES.flash;
+	const list = rated === "pro" ? ROLES.pro : ROLES.flash;
+	// A failover offset points past a failed entry; if that entry has since
+	// lost credentials, keep moving down the list.
+	const usable =
+		firstUsableFrom(list, state?.offset ?? 0, ctx.modelRegistry) ?? firstUsableFrom(list, 0, ctx.modelRegistry);
+	const role = usable?.role ?? list[0];
 	const model = ctx.modelRegistry.find(role.provider, role.id);
 	if (!model) throw new Error(`Model ${role.provider}/${role.id} is not in the catalog`);
 	return { model, thinkingLevel: request.thinkingLevel, state };
 }
 
-type Registry = ExtensionContext["modelRegistry"];
-
-/** Resolve the routable pair; undefined when either model is missing or unauthenticated. */
+/** Resolve the routable tiers; undefined unless each tier has at least one
+ * authenticated model and the two lists are not identical. */
 function resolvePair(registry: Registry) {
-	// Both roles on one model means there is nothing to switch between.
-	if (ROLES.flash.provider === ROLES.pro.provider && ROLES.flash.id === ROLES.pro.id) return undefined;
-	const flash = registry.find(ROLES.flash.provider, ROLES.flash.id);
-	const pro = registry.find(ROLES.pro.provider, ROLES.pro.id);
+	// Identical lists mean there is nothing to switch between.
+	if (roleKey(ROLES.flash) === roleKey(ROLES.pro)) return undefined;
+	const flash = firstUsable(ROLES.flash, registry);
+	const pro = firstUsable(ROLES.pro, registry);
 	if (!flash || !pro) return undefined;
-	if (!registry.hasConfiguredAuth(flash) || !registry.hasConfiguredAuth(pro)) return undefined;
 	return { flash, pro };
 }
 
@@ -951,14 +1077,14 @@ export function parseSelfRating(text: string): SelfRating | undefined {
 	return { rated: rating, confidence: conf };
 }
 
-/** Have mimo rate its own task. Returns undefined when it cannot answer. */
+/** Have the flash tier rate its own task. Returns undefined when it cannot answer. */
 async function rateWithSelf(
 	prompt: string,
 	ctx: ExtensionContext,
 	signal: AbortSignal,
 ): Promise<SelfRating | undefined> {
-	const model = ctx.modelRegistry.find(ROLES.flash.provider, ROLES.flash.id);
-	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
+	const model = firstUsable(ROLES.flash, ctx.modelRegistry);
+	if (!model) return undefined;
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), SELF_RATING_TIMEOUT_MS);
 	const onAbort = () => ctrl.abort();
@@ -1155,8 +1281,42 @@ function registerAuto(pi: ExtensionAPI): void {
 }
 
 async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promise<ModelRoute<AutoState>> {
-	// Both physical models must exist, or the router stays out of the way.
+	// Both tiers must have at least one usable model, or the router stays out of the way.
 	if (!resolvePair(ctx.modelRegistry)) return disabledRoute(request, ctx);
+
+	// Failover: a retry carries the model that just failed. Advance within that
+	// model's own tier to the next credentialed entry; the offset is stored in
+	// the branch state so the rest of the run keeps the failed-over model
+	// (prompt cache stays valid). A tier with no backends left fails the turn -
+	// pro never degrades to flash.
+	if (request.reason === "retry" && request.failed) {
+		const failedModel = request.failed.model as { provider: string; id: string } | undefined;
+		const tier: Difficulty | undefined = isTier(failedModel, ROLES.pro)
+			? "pro"
+			: isTier(failedModel, ROLES.flash)
+				? "flash"
+				: undefined;
+		if (tier) {
+			const list = tier === "pro" ? ROLES.pro : ROLES.flash;
+			const idx = list.findIndex((r) => r.provider === failedModel?.provider && r.id === failedModel?.id);
+			const next = firstUsableFrom(list, idx + 1, ctx.modelRegistry);
+			if (next) {
+				stats.failover++;
+				debugRating(
+					`failover ${tier}: ${failedModel?.provider}/${failedModel?.id} -> ${next.role.provider}/${next.role.id}`,
+				);
+				return {
+					model: next.model,
+					thinkingLevel: request.thinkingLevel,
+					state: { rated: tier, source: "failover", offset: next.idx },
+				};
+			}
+			throw new Error(
+				`auto-router: ${tier} tier exhausted - all configured backends failed (last: ${failedModel?.provider}/${failedModel?.id})`,
+			);
+		}
+		// The failed model is not one of ours: keep the normal routing below.
+	}
 
 	// Compaction summaries and other out-of-loop calls stay cheap.
 	if (request.reason === "direct") {
@@ -1166,9 +1326,14 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 
 	// The decision taken when this prompt arrived. Every request of the run -
 	// tool-loop continuations included - is served by it, so one prompt is one
-	// decision and the cache stays warm inside the run.
+	// decision and the cache stays warm inside the run. A failover offset
+	// recorded on the branch survives into the continuation (same tier).
 	if (PENDING && PENDING.source !== "chain") {
-		return routeTo(request, ctx, PENDING.rated, { rated: PENDING.rated, source: PENDING.source });
+		const inherited =
+			request.state?.rated === PENDING.rated && request.state.offset !== undefined
+				? { offset: request.state.offset }
+				: undefined;
+		return routeTo(request, ctx, PENDING.rated, { rated: PENDING.rated, source: PENDING.source, ...inherited });
 	}
 
 	// The hook did not run for this request (resume, late extension load):
@@ -1179,14 +1344,23 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 			stats.inherited++;
 			return routeTo(request, ctx, state.rated, state);
 		}
-		const previousRole: Difficulty | undefined = isRole(request.previous?.model, ROLES.pro)
+		const previousRole: Difficulty | undefined = isTier(request.previous?.model, ROLES.pro)
 			? "pro"
-			: isRole(request.previous?.model, ROLES.flash)
+			: isTier(request.previous?.model, ROLES.flash)
 				? "flash"
 				: undefined;
 		if (request.reason !== "user" && previousRole) {
 			stats.inherited++;
-			return routeTo(request, ctx, previousRole, { rated: previousRole });
+			// Prefer the entry the branch is actually on (previous.model), so a
+			// late extension load does not snap a failed-over branch back.
+			const list = previousRole === "pro" ? ROLES.pro : ROLES.flash;
+			const prevIdx = list.findIndex(
+				(r) => r.provider === request.previous?.model?.provider && r.id === request.previous?.model?.id,
+			);
+			return routeTo(request, ctx, previousRole, {
+				rated: previousRole,
+				...(prevIdx > 0 ? { offset: prevIdx } : {}),
+			});
 		}
 	}
 
@@ -1195,7 +1369,7 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 	const started = Date.now();
 	// "Current model" for step 4: pro when this branch is already on pro,
 	// otherwise flash (a brand-new session has no current model yet).
-	const keep: Difficulty = isRole(request.previous?.model, ROLES.pro) ? "pro" : "flash";
+	const keep: Difficulty = isTier(request.previous?.model, ROLES.pro) ? "pro" : "flash";
 	// request.signal is optional; with none, the raters' own deadlines apply.
 	const signal = request.signal ?? new AbortController().signal;
 	const { rated, source } = await chooseRating({
@@ -1218,9 +1392,7 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 }
 
 export default function (pi: ExtensionAPI) {
-	debugRating(
-		`roles flash=${ROLES.flash.provider}/${ROLES.flash.id} pro=${ROLES.pro.provider}/${ROLES.pro.id}`,
-	);
+	debugRating(`roles flash=${roleKey(ROLES.flash)} pro=${roleKey(ROLES.pro)}`);
 
 	// Register at load only when the extension has its own config: that is what
 	// makes router/auto resolvable as Pi's default model, since selection happens
@@ -1248,15 +1420,23 @@ export default function (pi: ExtensionAPI) {
 				const memoryLine = MEMORY
 					? `memory:  ${MEMORY.count} entries, ${stats.memoryReused}/${stats.memoryLookups} lookups reused`
 					: `memory:  not loaded (loads on the first abstain), ${stats.memoryReused}/${stats.memoryLookups} lookups reused`;
+				const tierLine = (name: string, list: Role[]): string => {
+					const entries = list.map((role) => {
+						const model = ctx.modelRegistry.find(role.provider, role.id);
+						const mark = !model ? "missing" : ctx.modelRegistry.hasConfiguredAuth(model) ? "ok" : "no-auth";
+						return `${role.provider}/${role.id} [${mark}]`;
+					});
+					return `${name}${entries.join(", ")}`;
+				};
 				return [
 					`config:  ${configFile()}${readOwnConfig() ? "" : "  (missing - run /auto-router to create it)"}`,
-					`flash:   ${roles.flash.provider}/${roles.flash.id}`,
-					`pro:     ${roles.pro.provider}/${roles.pro.id}`,
+					tierLine("flash:   ", roles.flash),
+					tierLine("pro:     ", roles.pro),
 					`pair:    ${pair ? "resolved in catalog" : "NOT available"}`,
 					`default: ${readDefaultModel() ?? "(unset)"}`,
 					`local:   ${stats.local}/${stats.prompts} prompts decided locally (${coverage}%), ${stats.abstain} sent to the chain`,
 					memoryLine,
-					`chain:   self ${stats.self}, jev ${stats.jev}, keep ${stats.keep}, direct ${stats.direct}, inherited ${stats.inherited}`,
+					`chain:   self ${stats.self}, jev ${stats.jev}, keep ${stats.keep}, direct ${stats.direct}, inherited ${stats.inherited}, failover ${stats.failover}`,
 				];
 			};
 			const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -1319,36 +1499,46 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const save = (flashModel: string, proModel: string): boolean => {
-				if (flashModel === proModel) {
+			const save = (flashModels: string[], proModels: string[]): boolean => {
+				if (flashModels.length === 1 && proModels.length === 1 && flashModels[0] === proModels[0]) {
 					say("flash and pro must be different models.", "warning");
 					return false;
 				}
-				const file = writeOwnConfig(flashModel, proModel);
-				say(`Saved ${file}\n  flash = ${flashModel}\n  pro   = ${proModel}`);
+				const file = writeOwnConfig(flashModels, proModels);
+				say(`Saved ${file}\n  flash = ${flashModels.join(", ")}\n  pro   = ${proModels.join(", ")}`);
 				return true;
 			};
 
 			if (sub === "set") {
-				const flashModel = parts.find((part) => part.startsWith("flash="))?.slice("flash=".length);
-				const proModel = parts.find((part) => part.startsWith("pro="))?.slice("pro=".length);
-				if (!parseRole(flashModel, { provider: "", id: "" }).provider || !parseRole(proModel, { provider: "", id: "" }).provider) {
-					say("usage: /auto-router set flash=<provider/model-id> pro=<provider/model-id>", "warning");
+				// Comma-separated failover lists; the first entry is the primary.
+				const parseList = (key: string): string[] =>
+					(parts.find((part) => part.startsWith(`${key}=`))?.slice(key.length + 1) ?? "")
+						.split(",")
+						.map((s) => s.trim())
+						.filter(Boolean);
+				const flashModels = parseList("flash");
+				const proModels = parseList("pro");
+				const invalid = { provider: "", id: "" };
+				const valid = (list: string[]) =>
+					list.length > 0 && list.every((s) => parseRole(s, invalid).provider !== "");
+				if (!valid(flashModels) || !valid(proModels)) {
+					say("usage: /auto-router set flash=<provider/model-id>[,<id>...] pro=<provider/model-id>[,<id>...]", "warning");
 					return;
 				}
-				if (save(flashModel!, proModel!)) await ctx.reload();
+				if (save(flashModels, proModels)) await ctx.reload();
 				return;
 			}
 
 			if (sub) {
-				say("usage: /auto-router | /auto-router status | /auto-router memory [reset] | /auto-router set flash=<id> pro=<id>", "warning");
+				say("usage: /auto-router | /auto-router status | /auto-router memory [reset] | /auto-router set flash=<id>[,<id>...] pro=<id>[,<id>...]", "warning");
 				return;
 			}
 
-			// Interactive wizard: pick both roles from the models Pi can reach.
+			// Interactive wizard: pick the primary of each tier from the models Pi
+			// can reach; failover entries are added via /auto-router set or the TOML.
 			if (!ctx.hasUI || ctx.mode !== "tui") {
 				for (const line of status()) say(line);
-				say("usage: /auto-router status | /auto-router memory [reset] | /auto-router set flash=<provider/model-id> pro=<provider/model-id>");
+				say("usage: /auto-router status | /auto-router memory [reset] | /auto-router set flash=<provider/model-id>[,<id>...] pro=<provider/model-id>[,<id>...]");
 				return;
 			}
 			const candidates = (await ctx.modelRegistry.getAvailableOfType("chat"))
@@ -1362,7 +1552,7 @@ export default function (pi: ExtensionAPI) {
 			if (!flashModel) return;
 			const proModel = await ctx.ui.select("pro model (strong escalation target)", candidates);
 			if (!proModel) return;
-			if (save(flashModel, proModel)) await ctx.reload();
+			if (save([flashModel], [proModel])) await ctx.reload();
 		},
 	});
 
