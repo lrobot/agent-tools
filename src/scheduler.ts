@@ -11,6 +11,7 @@ type ValidateScheduleResult =
   | { ok: false; error: string };
 
 const SUBAGENT_OUTPUT_SNIPPET_LENGTH = 500;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /** Truncate `text` to `SUBAGENT_OUTPUT_SNIPPET_LENGTH`, appending an ellipsis if cut. */
 function snippet(text: string): string {
@@ -25,15 +26,18 @@ function snippet(text: string): string {
 export class CronScheduler {
   private jobs = new Map<string, Cron>();
   private intervals = new Map<string, NodeJS.Timeout>();
+  private pendingJitter = new Map<string, Set<NodeJS.Timeout>>();
   private activeSubagents = new Set<AbortController>();
   private readonly storage: CronStorage;
   private readonly pi: ExtensionAPI;
   private readonly ctx: ExtensionContext;
+  private readonly random: () => number;
 
-  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext) {
+  constructor(storage: CronStorage, pi: ExtensionAPI, ctx: ExtensionContext, random: () => number = Math.random) {
     this.storage = storage;
     this.pi = pi;
     this.ctx = ctx;
+    this.random = random;
   }
 
   /**
@@ -77,6 +81,8 @@ export class CronScheduler {
       clearInterval(interval);
     }
     this.intervals.clear();
+
+    for (const id of this.pendingJitter.keys()) this.clearPendingJitter(id);
 
     // Abort any in-flight subagent runs so they don't keep streaming or post
     // markers against a stale pi reference after session shutdown.
@@ -132,10 +138,13 @@ export class CronScheduler {
    */
   private scheduleJob(job: CronJob): void {
     try {
+      const validatedJitter = CronScheduler.validateJitter(job.jitter, job.type);
+      if (!validatedJitter.valid) throw new Error(validatedJitter.error);
+      const maxJitterMs = validatedJitter.maxDelayMs;
       if (job.type === "interval" && job.intervalMs) {
         // Interval-based scheduling
         const interval = setInterval(() => {
-          this.executeJob(job);
+          this.executeWithJitter(job, maxJitterMs);
         }, job.intervalMs);
         this.intervals.set(job.id, interval);
       } else if (job.type === "once") {
@@ -169,7 +178,7 @@ export class CronScheduler {
       } else {
         // Standard cron expression
         const cron = new Cron(job.schedule, () => {
-          this.executeJob(job);
+          this.executeWithJitter(job, maxJitterMs);
         });
         this.jobs.set(job.id, cron);
       }
@@ -184,7 +193,7 @@ export class CronScheduler {
   }
 
   /**
-   * Unschedule a job
+   * Unschedule a job and every delayed occurrence it already generated.
    */
   private unscheduleJob(id: string): void {
     const cron = this.jobs.get(id);
@@ -198,6 +207,35 @@ export class CronScheduler {
       clearInterval(interval);
       this.intervals.delete(id);
     }
+    this.clearPendingJitter(id);
+  }
+
+  /** Add an independently sampled delay to one automatic occurrence. */
+  private executeWithJitter(job: CronJob, maxDelayMs: number): void {
+    if (maxDelayMs === 0) {
+      void this.executeJob(job);
+      return;
+    }
+    const delayMs = Math.min(maxDelayMs, Math.floor(this.random() * (maxDelayMs + 1)));
+    if (delayMs === 0) {
+      void this.executeJob(job);
+      return;
+    }
+    let timer: NodeJS.Timeout;
+    timer = setTimeout(() => {
+      const pending = this.pendingJitter.get(job.id);
+      pending?.delete(timer);
+      if (pending?.size === 0) this.pendingJitter.delete(job.id);
+      void this.executeJob(job);
+    }, delayMs);
+    const pending = this.pendingJitter.get(job.id) ?? new Set<NodeJS.Timeout>();
+    pending.add(timer);
+    this.pendingJitter.set(job.id, pending);
+  }
+
+  private clearPendingJitter(id: string): void {
+    for (const timer of this.pendingJitter.get(id) ?? []) clearTimeout(timer);
+    this.pendingJitter.delete(id);
   }
 
   /**
@@ -406,6 +444,22 @@ export class CronScheduler {
    */
   private emitChange(event: CronChangeEvent): void {
     this.pi.events.emit("cron:change", event);
+  }
+
+  /**
+   * Validate a seconds-based jitter value and convert its upper bound to ms.
+   */
+  static validateJitter(jitter: unknown, type: CronJobType):
+    | { valid: true; maxDelayMs: number }
+    | { valid: false; error: string } {
+    if (jitter === undefined) return { valid: true, maxDelayMs: 0 };
+    if (typeof jitter !== "number" || !Number.isFinite(jitter) || jitter < 0 || jitter * 1000 > MAX_TIMER_DELAY_MS) {
+      return { valid: false, error: "jitter must be a finite, non-negative number of seconds that fits in one timer" };
+    }
+    if (type === "once" && jitter > 0) {
+      return { valid: false, error: "jitter is supported for cron and interval jobs only; omit it or use 0 for once jobs" };
+    }
+    return { valid: true, maxDelayMs: Math.round(jitter * 1000) };
   }
 
   /**

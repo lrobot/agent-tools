@@ -28,6 +28,8 @@ export interface CronJob {
   type: CronJobType;
   /** Interval in milliseconds (for interval type) */
   intervalMs?: number;
+  /** Maximum random delay in seconds added independently to each cron/interval occurrence. Omit or set 0 for exact timing. */
+  jitter?: number;
   /** When the job was created */
   createdAt: string;
   /** Last execution timestamp */
@@ -102,6 +104,14 @@ export const CronToolParams = Type.Object({
   type: Type.Optional(
     StringEnum(["cron", "once", "interval"], {
       description: "Job type. Use 'once' for relative times like '+10s'. Default is cron",
+    })
+  ),
+  jitter: Type.Optional(
+    Type.Number({
+      minimum: 0,
+      maximum: 2_147_483.647,
+      description:
+        "Optional maximum random delay in seconds for cron/interval jobs. Each automatic occurrence gets an independent uniform delay from 0 through this value. Omit or set 0 for exact timing; positive values are not supported for once jobs.",
     })
   ),
   description: Type.Optional(

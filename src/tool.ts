@@ -20,7 +20,7 @@ export function createCronTool(
     name: "schedule_prompt",
     label: "Schedule Prompt",
     description:
-      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup.",
+      "IMPORTANT: For action='add', you MUST provide both 'schedule' parameter AND 'prompt' parameter. Schedule prompts at times/intervals. Schedule formats: 6-field cron (with seconds: '0 * * * * *' = every minute), ISO timestamp, relative time (+10s, +5m, +1h), or interval (5m, 1h). Type defaults to 'cron', use 'once' for relative/ISO times. Optional jitter is a maximum random delay in seconds for cron/interval jobs, sampled independently per automatic occurrence; omit or set 0 for exact timing. Actions: add (needs schedule+prompt), list, remove/enable/disable/update (need jobId), cleanup.",
     parameters: CronToolParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -79,6 +79,8 @@ export function createCronTool(
             }
 
             const type = (params.type || "cron") as CronJobType;
+            const jitterValidation = CronScheduler.validateJitter(params.jitter, type);
+            if (!jitterValidation.valid) throw new Error(jitterValidation.error);
             const validated = CronScheduler.validateSchedule(type, params.schedule);
             if (!validated.ok) throw new Error(validated.error);
             const schedule = validated.schedule;
@@ -95,6 +97,7 @@ export function createCronTool(
               enabled: true,
               type,
               intervalMs,
+              jitter: params.jitter,
               createdAt: now,
               runCount: 0,
               description: params.description,
@@ -114,11 +117,12 @@ export function createCronTool(
             const modelLine = job.model
               ? `\nModel: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`
               : "";
+            const jitterLine = job.jitter ? `\nJitter: random 0-${job.jitter}s per automatic occurrence` : "";
             return {
               content: [
                 {
                   type: "text",
-                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}\nPrompt: ${job.prompt}${modelLine}`,
+                  text: `✓ Created cron job "${job.name}" (${job.id})\nType: ${job.type}\nSchedule: ${job.schedule}${jitterLine}\nPrompt: ${job.prompt}${modelLine}`,
                 },
               ],
               details,
@@ -234,6 +238,9 @@ export function createCronTool(
               throw new Error(`Job not found: ${params.jobId}`);
             }
 
+            const jitterValidation = CronScheduler.validateJitter(params.jitter, job.type);
+            if (!jitterValidation.valid) throw new Error(jitterValidation.error);
+
             // Reject empty-string model (schema also enforces minLength: 1).
             // To switch a job from subagent → inline mode, remove and re-add
             // it without `model` — there's no in-place clearing.
@@ -251,6 +258,7 @@ export function createCronTool(
             if (params.notify !== undefined) updates.notify = params.notify;
             if (params.extensions !== undefined) updates.extensions = params.extensions;
             if (params.skills !== undefined) updates.skills = params.skills;
+            if (params.jitter !== undefined) updates.jitter = params.jitter;
 
             if (params.schedule) {
               // Same resolution rules as `add`: relative time (`+5m`) → ISO,
@@ -303,6 +311,7 @@ export function createCronTool(
 
               lines.push(`${status} ${job.name} (${job.id})`);
               lines.push(`  Type: ${job.type} | Schedule: ${job.schedule}`);
+              if (job.jitter) lines.push(`  Jitter: random 0-${job.jitter}s per automatic occurrence`);
               if (job.model) {
                 lines.push(`  Model: ${job.model} (runs in subagent${job.notify ? ", notifies parent" : ""}${job.extensions ? ", extensions" : ""}${job.skills ? ", skills" : ""})`);
               }
@@ -394,7 +403,7 @@ export function createCronTool(
           const status = job.enabled ? theme.fg("success", "✓") : theme.fg("muted", "✗");
           lines.push(`${status} ${theme.fg("text", job.name)} ${theme.fg("dim", `(${job.id})`)}`);
           lines.push(
-            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule}`
+            `  ${theme.fg("dim", "Type:")} ${job.type} ${theme.fg("dim", "| Schedule:")} ${job.schedule}${job.jitter ? ` ${theme.fg("dim", "| Jitter:")} 0-${job.jitter}s` : ""}`
           );
           if (job.model) {
             const subagentTag = job.notify ? "(subagent, notifies parent)" : "(subagent)";

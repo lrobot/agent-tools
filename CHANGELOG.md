@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional `jitter` for recurring jobs, expressed as a non-negative maximum delay in **seconds**. Each automatic cron/interval occurrence independently receives a uniformly sampled delay from 0 through that value. Omitting it or setting `0` preserves exact timing; positive values are rejected for one-shot jobs
+- `schedule_prompt` schema, description, add/update handling, list output, and README examples for seconds-based jitter. Pending delayed occurrences are tracked separately and cancelled on job update/disable/remove or session shutdown
+
 ## [0.4.1] - 2026-06-23
 
 ### Added

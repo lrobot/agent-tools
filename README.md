@@ -55,6 +55,7 @@ Get prompted to do something once at a specific time:
 - ✓ **Human-readable display**: "every minute", "daily at 9:00" instead of raw cron expressions
 - ✓ **Status tracking**: next run, last run, execution count, errors, prompt preview
 - ✓ **Flexible scheduling**: 6-field cron, intervals (5m, 1h), relative time (+10s), ISO timestamps
+- ✓ **Randomized recurring tasks**: optional per-occurrence jitter of 0–N **seconds**, with exact timing preserved when omitted or set to 0
 - ✓ **User commands**: `/schedule-prompt` opens a `Jobs` overlay (hotkey-driven: `↑↓` select, `a` add, `t` toggle enabled, `s` toggle scope, `x` remove, `c` cleanup) and a `Settings` submenu
 - ✓ **Persistent settings**: widget visibility persists across sessions and package upgrades (project file overrides global defaults)
 - ✓ **Safety features**: duplicate name prevention, infinite loop detection, past timestamp handling
@@ -120,6 +121,7 @@ The widget displays below your editor (only when jobs exist):
 | `prompt` | string | on `add` | Prompt text to execute when the job fires |
 | `jobId` | string | on `remove` / `enable` / `disable` / `update` | Target job |
 | `type` | `cron` \| `once` \| `interval` | no | Job type. Default `cron`; use `once` for relative times like `+10s` |
+| `jitter` | non-negative number | no | Maximum random delay **in seconds**, sampled independently from 0 through this value for each automatic `cron`/`interval` occurrence. Omit or use `0` for exact timing. Positive values are rejected for `once` jobs |
 | `description` | string | no | Free-form note |
 | `model` | non-empty string | no | If set, run the prompt in a fresh in-process agent session with this model instead of injecting into the current chat. Accepts fuzzy names (`haiku`, `sonnet`) or `provider/model-id`. To switch a job from subagent back to inline mode, remove and re-add it without `model` (no in-place clearing) |
 | `notify` | boolean | no | Subagent-only. If `true`, the parent agent is woken to react to the subagent's result. Default `false` (result shown in chat, parent not interrupted). No-op for inline (no-model) jobs — the prompt itself already wakes the parent. Recommended only for low-frequency jobs |
@@ -176,6 +178,7 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 
 - Uses `croner` library for cron expressions
 - Native `setTimeout`/`setInterval` for intervals and one-shots
+- Optional `jitter` adds a fresh random delay to each automatic cron/interval occurrence; each pending delay is tracked independently and cancelled on remove, update, disable, or shutdown
 - Tracks: next run, last run, execution count, status (running/success/error)
 
 **Execution:**
@@ -234,6 +237,24 @@ Toggle the default for new jobs in `/schedule-prompt → Settings → Bind new j
 "check system health every 5 minutes"
   → schedule="5m", type=interval
 ```
+
+### Randomized recurring tasks
+
+`jitter` is a **number of seconds**, not minutes. It defines an inclusive maximum random delay added after each automatic cron or interval occurrence. The value is sampled independently for every occurrence.
+
+```
+"check system health every 5 minutes with up to 10 seconds of random delay"
+  → schedule="5m", type=interval, jitter=10
+  → actual delay per occurrence: uniformly sampled from 0 through 10 seconds
+
+"run the daily summary around midnight with up to 30 seconds of jitter"
+  → schedule="0 0 0 * * *", type=cron, jitter=30
+
+"run exactly every 5 minutes without randomness"
+  → schedule="5m", type=interval, jitter=0 (or omit jitter)
+```
+
+Jitter applies only to automatic `cron` and `interval` occurrences. Positive values are rejected for one-shot `once` jobs. Large jitter relative to the base interval can leave several occurrences pending, overlap their executions, or make a later occurrence finish first; the scheduler does not silently drop those occurrences. Pending delays are cancelled when their job is removed, disabled, updated, or its session shuts down. Random delay is sampled per live session and is not persisted as an exact fire timestamp.
 
 ### Run in a separate agent session (per-task model)
 
