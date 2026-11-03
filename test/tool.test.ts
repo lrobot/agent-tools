@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createCronTool } from "../src/tool.js";
-import type { CronJob } from "../src/types.js";
+import { type CronJob, CronToolParams } from "../src/types.js";
 
 // Minimal in-memory CronStorage stand-in: implements just the surface the tool calls.
 function makeStorage(seedJobs: CronJob[] = []) {
@@ -72,6 +72,70 @@ function exampleJob(overrides: Partial<CronJob> = {}): CronJob {
     ...overrides,
   };
 }
+
+describe("schedule_prompt — jitter", () => {
+  it("exposes jitter as seconds in the agent tool schema and description", () => {
+    const { tool } = buildTool();
+    expect((CronToolParams.properties as any).jitter.description).toContain("seconds");
+    expect(tool.description).toContain("jitter");
+  });
+
+  it("stores a non-negative jitter second value on a recurring job", async () => {
+    const { tool, storage } = buildTool();
+    const result = await tool.execute(
+      "call",
+      { action: "add", schedule: "1m", type: "interval", prompt: "test", jitter: 12.5 } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    const id = result.details?.jobs?.[0].id as string;
+    expect(result.details?.error).toBeUndefined();
+    expect(storage.getJob(id).jitter).toBe(12.5);
+  });
+
+  it("updates jitter and accepts zero to restore exact timing", async () => {
+    const { tool, storage } = buildTool([
+      exampleJob({ id: "jittered", type: "interval", schedule: "1m", intervalMs: 60000, jitter: 10 }),
+    ]);
+    const result = await tool.execute(
+      "call",
+      { action: "update", jobId: "jittered", jitter: 0 } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toBeUndefined();
+    expect(storage.getJob("jittered").jitter).toBe(0);
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_484, "10"])(
+    "rejects invalid jitter value %s",
+    async (jitter) => {
+      const { tool } = buildTool();
+      const result = await tool.execute(
+        "call",
+        { action: "add", schedule: "1m", type: "interval", prompt: "test", jitter } as any,
+        undefined,
+        undefined,
+        makeCtx(),
+      );
+      expect(result.details?.error).toContain("jitter");
+    },
+  );
+
+  it("rejects positive jitter on one-shot jobs instead of silently ignoring it", async () => {
+    const { tool } = buildTool();
+    const result = await tool.execute(
+      "call",
+      { action: "add", schedule: "+10s", type: "once", prompt: "test", jitter: 5 } as any,
+      undefined,
+      undefined,
+      makeCtx(),
+    );
+    expect(result.details?.error).toContain("cron and interval");
+  });
+});
 
 describe("schedule_prompt — notify behavior", () => {
   describe("add", () => {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CronScheduler } from "../src/scheduler.js";
 import type { CronJob } from "../src/types.js";
 
@@ -694,5 +694,133 @@ describe("CronScheduler — extensions/skills", () => {
 
     const options = mockRunSubagentOnce.mock.calls[0][4];
     expect(options).toEqual({ extensions: false, skills: undefined });
+  });
+});
+
+describe("CronScheduler — jitter", () => {
+  const schedulers: CronScheduler[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    mockRunSubagentOnce.mockReset();
+  });
+
+  afterEach(() => {
+    for (const scheduler of schedulers.splice(0)) scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  function start(job: CronJob, random: () => number) {
+    const pi = makePi();
+    const scheduler = new CronScheduler(makeStorage([job]), pi, makeCtx(), random);
+    schedulers.push(scheduler);
+    scheduler.start();
+    return { pi, scheduler };
+  }
+
+  it("delays an interval occurrence by the sampled number of seconds", () => {
+    const random = vi.fn(() => 0.5);
+    const { pi } = start(
+      exampleJob({ type: "interval", schedule: "1m", intervalMs: 60000, jitter: 10 }),
+      random,
+    );
+
+    vi.advanceTimersByTime(60000);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(4999);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+
+    expect(random).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps exact timing and does not sample when jitter is zero", () => {
+    const random = vi.fn(() => 1);
+    const { pi } = start(
+      exampleJob({ type: "interval", schedule: "1m", intervalMs: 60000, jitter: 0 }),
+      random,
+    );
+
+    vi.advanceTimersByTime(60000);
+
+    expect(random).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("samples independently for every occurrence and supports both range boundaries", () => {
+    const random = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(0.5);
+    const { pi } = start(
+      exampleJob({ type: "interval", schedule: "1m", intervalMs: 60000, jitter: 10 }),
+      random,
+    );
+
+    vi.advanceTimersByTime(60000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(60000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(4999);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+
+    expect(random).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies jitter to cron occurrences", () => {
+    const { pi } = start(
+      exampleJob({ type: "cron", schedule: "* * * * * *", jitter: 4 }),
+      () => 0.25,
+    );
+
+    vi.advanceTimersByTime(1000);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(999);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a pending jittered occurrence when the job is removed", () => {
+    const { pi, scheduler } = start(
+      exampleJob({ type: "interval", schedule: "1m", intervalMs: 60000, jitter: 10 }),
+      () => 0.5,
+    );
+
+    vi.advanceTimersByTime(60000);
+    scheduler.removeJob("job-1");
+    vi.advanceTimersByTime(10000);
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("cancels all pending jittered occurrences on stop", () => {
+    const { pi, scheduler } = start(
+      exampleJob({ type: "interval", schedule: "1m", intervalMs: 60000, jitter: 10 }),
+      () => 0.5,
+    );
+
+    vi.advanceTimersByTime(60000);
+    scheduler.stop();
+    vi.advanceTimersByTime(10000);
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not drop occurrences when jitter exceeds the base interval", () => {
+    const { pi } = start(
+      exampleJob({ type: "interval", schedule: "1s", intervalMs: 1000, jitter: 5 }),
+      () => 1,
+    );
+
+    vi.advanceTimersByTime(2000);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(4000);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1000);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 });
