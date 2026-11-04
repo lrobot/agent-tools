@@ -1,0 +1,8 @@
+{
+  "version": "1.2.0",
+  "platform": "linux",
+  "arch": "x64",
+  "url": "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-linux-x64.tar.gz",
+  "archiveSha256": "00fc36cffdebceea5a48230da62cf3fb463178f8fe185766652f96002a246847",
+  "binarySha256": "0da162bafd73665b3c0d3bb7ba87f873b6c79dcd4887a4eb001cc4c81c3282b8"
+}
