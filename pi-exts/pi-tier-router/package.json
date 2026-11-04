@@ -39,7 +39,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "dependencies": {
-    "pi-tui-multiselect-list": "link:../pi-ui-multiselect",
+    "pi-tui-multiselect-list": "link:../libs/pi-ui-multiselect",
     "smol-toml": "^1.9.1"
   }
 }
