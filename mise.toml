@@ -5,7 +5,7 @@
 # os.homedir() conventions, never via machine-specific absolute paths:
 #
 #   ~/.local/bin/cld(.exe)      built launcher binary + cld.*.yaml instances
-#   ~/.local/bin/providers.yaml symlink -> pi-exts/yaml-providers/providers.yaml
+#   ~/.local/bin/providers.yaml symlink -> pi-exts/pi-yaml-providers/providers.yaml
 #   ~/.agent_instances.yaml     instance defs, synced via personal dotfiles
 #
 # ~/.dotc/ keeps only the compiled binary's historical docs (doc/) and is no

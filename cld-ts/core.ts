@@ -218,7 +218,7 @@ function runModelSelect(binDir: string, instance: string, provider: string, prov
 
   // Optional max_context_ref catalog (models.dev-shaped) as the fallback for
   // providers whose /models listing doesn't publish context limits - same
-  // source and precedence as pi-exts/yaml-providers (live > ref > unknown).
+  // source and precedence as pi-exts/pi-yaml-providers (live > ref > unknown).
   const maxContextRefUrl = yqGet(providersYaml, provider, '.max_context_ref // ""');
   let contextRefCatalog: ContextRefCatalog | null = null;
   if (maxContextRefUrl) {

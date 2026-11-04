@@ -14,10 +14,10 @@ agent-tools/
 ├── scripts/              task scripts (.sh POSIX half + .ps1 Windows half)
 ├── cld-ts/               cld launcher sources (core.ts compiled to a native binary)
 ├── ts-lib/               shared helpers (lib.ts) + cross-machine yaml path resolvers
-├── cfg/                  (reserved; providers.yaml lives in pi-exts/yaml-providers)
+├── cfg/                  (reserved; providers.yaml lives in pi-exts/pi-yaml-providers)
 └── pi-exts/
     ├── include-rule.ts   loaded via settings.json "extensions" (file path)
-    ├── yaml-providers/   pi extension: yaml-defined providers (plain files, this repo)
+    ├── pi-yaml-providers/ pi extension: yaml-defined providers (plain files, this repo)
     ├── pi-antigravity/   GIT SUBTREE of github.com:Rahularya01/pi-antigravity (main)
     ├── pi-multi-account/ GIT SUBTREE of github.com:Sarrius/pi-multi-account (main)
     ├── pi-proxy-router/  GIT SUBTREE of github.com:leench/pi-proxy-router (master)
@@ -30,7 +30,7 @@ agent-tools/
 |---|---|
 | `~/.local/bin/cld(.exe)` | built launcher binary (build.ts output) |
 | `~/.local/bin/cld.*.yaml` | per-instance configs (cld resolves them relative to the binary) |
-| `~/.local/bin/providers.yaml` | symlink -> `pi-exts/yaml-providers/providers.yaml` (setup-providers-link) |
+| `~/.local/bin/providers.yaml` | symlink -> `pi-exts/pi-yaml-providers/providers.yaml` (setup-providers-link) |
 | `~/.agent_instances.yaml` | instance definitions, synced between machines via dotfiles |
 
 Env overrides: `AGENT_PROVIDERS_YAML`, `AGENT_INSTANCES_YAML`
@@ -95,7 +95,7 @@ fork branch contains just the extension's own history + your changes.
   add the subtree, then re-apply local changes.
 - Never `--squash` a subtree you intend to `subtree push` later.
 - `node_modules/` is gitignored everywhere; after a fresh clone run
-  `bun install` in `pi-exts/yaml-providers` (and the subtree dirs that
+  `bun install` in `pi-exts/pi-yaml-providers` (and the subtree dirs that
   need it) before `pi` loads them.
 
 ## Machine setup (fresh clone, any OS)
@@ -109,7 +109,7 @@ pi install <clone-path>/pi-exts/pi-antigravity
 pi install <clone-path>/pi-exts/pi-multi-account
 pi install <clone-path>/pi-exts/pi-proxy-router
 pi install <clone-path>/pi-exts/pi-usage
-pi install <clone-path>/pi-exts/yaml-providers
+pi install <clone-path>/pi-exts/pi-yaml-providers
 # plus: add "<clone-path>/pi-exts/include-rule.ts" to settings.json "extensions"
 ```
 

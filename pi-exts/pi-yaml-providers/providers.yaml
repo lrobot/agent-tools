@@ -139,3 +139,10 @@ openrouter:
   models:
     meta-llama-3-3-70b: "meta-llama/llama-3.3-70b-instruct"
     qwen-2-5-72b: "qwen/qwen-2.5-72b-instruct"
+wodelou:
+  name: "OpenRouter"
+  base_url: "https://app-token.wodelou.cn/api/anthropic"
+  models_url: "https://app-token.wodelou.cn/api/v3/models"
+  base_url_v1: "https://app-token.wodelou.cn/api/v3"
+  anthropic_url: "https://app-token.wodelou.cn/api/anthropic/v1/messages"
+  documentation: "https://app-token.wodelou.cn"

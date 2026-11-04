@@ -3,7 +3,7 @@
 # the cld binary and the yaml-providers pi extension find providers.yaml
 # without any machine-specific absolute path in the code:
 #
-#   %USERPROFILE%\.local\bin\providers.yaml -> <this repo>\pi-exts\yaml-providers\providers.yaml
+#   %USERPROFILE%\.local\bin\providers.yaml -> <this repo>\pi-exts\pi-yaml-providers\providers.yaml
 #
 # Uses a directory-style junction target equivalent for a single file: on
 # Windows a file symlink is created (developer mode or admin allows this);
@@ -13,7 +13,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$src = Join-Path $repoRoot 'pi-exts\yaml-providers\providers.yaml'
+$src = Join-Path $repoRoot 'pi-exts\pi-yaml-providers\providers.yaml'
 $destDir = Join-Path $HOME '.local\bin'
 $dest = Join-Path $destDir 'providers.yaml'
 

@@ -6,7 +6,7 @@
 # split as the old setup-pi-ext vs setup-omp-ext pair in ~/.dotc.
 set -euo pipefail
 
-SRC="$(cd "$(dirname "$0")/../pi-exts/yaml-providers" && pwd)"
+SRC="$(cd "$(dirname "$0")/../pi-exts/pi-yaml-providers" && pwd)"
 
 cd "$SRC"
 bun install

@@ -1,5 +1,5 @@
 {
-  "name": "pi-ext-dotc-providers",
+  "name": "pi-yaml-providers",
   "private": true,
   "dependencies": {
     "yaml": "^2.6.0"

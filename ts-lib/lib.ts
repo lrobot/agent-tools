@@ -21,7 +21,7 @@ import path from "path";
 // on any machine (mac/Linux today, Windows later):
 //  - instances yaml is a home-dir dotfile, synced between machines as part of
 //    the personal dotfiles (same path everywhere via os.homedir()).
-//  - providers yaml lives in this repo (pi-exts/yaml-providers/providers.yaml);
+//  - providers yaml lives in this repo (pi-exts/pi-yaml-providers/providers.yaml);
 //    the repo may be cloned anywhere per machine, so the resolved path is a
 //    stable per-machine symlink ~/.local/bin/providers.yaml -> <repo>/...,
 //    created by the setup-providers-link mise task. An env var overrides both.
@@ -530,7 +530,7 @@ export function fetchContextRefCatalog(url: string): ContextRefFetchResult {
 }
 
 // ── context-ref disk cache + sync fetch (for cld-ts's CJS/no-await world) ─
-// Shares cache dir AND file format with pi-exts/yaml-providers/cache.ts
+// Shares cache dir AND file format with pi-exts/pi-yaml-providers/cache.ts
 // (`_context_ref_<sanitized-url>.json` holding { fetchedAt, catalog }), so a
 // catalog the pi extension already downloaded is reused here and vice versa.
 // The pi-exts wrapper (contextRef.ts getContextRef) is async only for Promise

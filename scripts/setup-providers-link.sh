@@ -4,7 +4,7 @@
 # extension find providers.yaml without any machine-specific absolute path
 # in the code:
 #
-#   ~/.local/bin/providers.yaml -> <this repo>/pi-exts/yaml-providers/providers.yaml
+#   ~/.local/bin/providers.yaml -> <this repo>/pi-exts/pi-yaml-providers/providers.yaml
 #
 # The repo may be cloned anywhere on each machine; ~/.local/bin (i.e.
 # %USERPROFILE%\.local\bin on Windows) is the one stable location every
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="$REPO_ROOT/pi-exts/yaml-providers/providers.yaml"
+SRC="$REPO_ROOT/pi-exts/pi-yaml-providers/providers.yaml"
 DEST="$HOME/.local/bin/providers.yaml"
 
 mkdir -p "$HOME/.local/bin"
