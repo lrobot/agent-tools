@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+extensions/auto-router.toml
+extensions/auto-router.json
+extensions/auto-router-memory.jsonl
