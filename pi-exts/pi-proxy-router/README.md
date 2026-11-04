@@ -117,7 +117,7 @@ This extension has three routing layers:
 
 - `models` wraps `stream` / `streamSimple` in the current session's model registry, resolves rules by model id for every API type, and injects undici fetch with a custom dispatcher. Deferred fetch/cancel, image generation, and classification requests of wrapped providers use the same per-model rule.
 - The process-wide dispatcher also routes known model endpoints by their `baseUrl` (chat, image, and classifier models), covering foreground children and HTTP APIs that bypass the provider wrapper.
-- `auth` installs a process-wide wrapper around Pi's default dispatcher. It selects a provider dispatcher only for known OAuth endpoints and delegates all other requests to Pi's original pipeline.
+- `auth` wraps Pi's actual global `fetch` and selects a provider route only for known OAuth endpoints, delegating all other requests to Pi's original pipeline. This is required because Pi's bundled Undici and the extension's npm Undici copy do not share global dispatcher state. The dispatcher wrapper remains for callers that use the extension's Undici pipeline directly.
 
 - `http://` / `https://` → undici `ProxyAgent`
 - `socks5h://` → built-in `SocksDispatcher` (implements the undici Dispatcher interface over `socks-proxy-agent`, forwarded to node http/https.request)

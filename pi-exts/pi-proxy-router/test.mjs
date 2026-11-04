@@ -45,6 +45,17 @@ function checkRoute(name, run, needle) {
 		} else console.log(`✓ ${name}`);
 	}
 }
+async function checkFetchRoute(name, url, needle) {
+	try {
+		await globalThis.fetch(url, { method: "POST" });
+		failures.push(`${name}: expected a routed failure, got the original fetch`);
+	} catch (error) {
+		const message = String(error?.message ?? error);
+		if (needle && !message.includes(needle)) {
+			failures.push(`${name}: expected "${needle}" in "${message}"`);
+		} else console.log(`✓ ${name}`);
+	}
+}
 
 // ── hermetic fixture config ────────────────────────────────────────────
 
@@ -99,6 +110,12 @@ setGlobalDispatcher({
 	destroy: async () => {},
 });
 
+const originalFetchCalls = [];
+globalThis.fetch = async (input) => {
+	originalFetchCalls.push(String(input));
+	return new Response(null, { status: 204 });
+};
+
 const { default: factory } = await import("./index.ts");
 
 const handlers = new Map();
@@ -135,6 +152,16 @@ checkRoute(
 checkRoute(
 	"auth: openai-codex device token endpoint unchanged",
 	() => dispatchUrl("https://auth.openai.com", "/api/accounts/deviceauth/token"),
+	"codex-auth.example.test",
+);
+await checkFetchRoute(
+	"auth: Pi global fetch routes the openai ChatGPT token exchange",
+	"https://auth.openai.com/api/accounts/oauth/token",
+	"chatgpt-auth.example.test",
+);
+await checkFetchRoute(
+	"auth: Pi global fetch routes the openai-codex token exchange",
+	"https://auth.openai.com/oauth/token",
 	"codex-auth.example.test",
 );
 

@@ -115,7 +115,7 @@ pi install npm:pi-proxy-router
 
 - `models` 在当前 session 的 model registry 中包装 provider 的 `stream` / `streamSimple`，按模型 id 解析规则，覆盖所有 API 类型，并用 undici fetch + 自定义 dispatcher 注入传输层。已包装 provider 的 deferred fetch/cancel、图片生成与分类请求使用同一套逐模型规则。
 - 进程级 dispatcher 根据已知模型（chat、image、classifier）的 `baseUrl` 再做 endpoint 路由，覆盖未加载本扩展的前台子 agent 和未使用 provider wrapper 的 HTTP API。
-- `auth` 在 Pi 进程内安装一个保留默认 dispatcher 的路由包装器，只对已知 OAuth endpoint 选择认证 provider 的 dispatcher，其他请求继续交给 Pi 默认链路。
+- `auth` 包装 Pi 实际使用的全局 `fetch`，只对已知 OAuth endpoint 选择认证 provider 的路由，其他请求继续交给 Pi 默认链路。必须包装真实 `fetch`，因为 Pi 内置的 Undici 与扩展加载的 npm Undici 副本不共享 global dispatcher；原 dispatcher 包装仍保留给直接使用扩展 Undici 链路的调用方。
 
 - `http://` / `https://` → undici `ProxyAgent`
 - `socks5h://` → 内置 `SocksDispatcher`（基于 `socks-proxy-agent` 实现 undici Dispatcher 接口，转发为 node http/https.request）

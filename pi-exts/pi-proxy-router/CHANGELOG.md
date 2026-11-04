@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Route built-in OAuth token requests through Pi's actual global `fetch`. Pi's bundled Undici and the extension's npm Undici copy have independent global dispatchers, so dispatcher-only auth routing could silently fall back to a direct connection. Covers both `openai` and `openai-codex` and preserves the native Bun HTTP proxy path.
+
 ## 1.3.0 - 2026-10-06
 
 ### Added

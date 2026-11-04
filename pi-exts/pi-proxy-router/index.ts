@@ -455,6 +455,7 @@ function applyAllProxy(noproxyFlag: boolean): void {
   // The dispatcher stays installed for auth rules; /allproxy only changes the
   // dynamic decision made by that dispatcher.
   ensureGlobalDispatcher(noproxyFlag);
+  ensureGlobalFetch();
 }
 
 function getRequestUrl(options: any): URL | null {
@@ -529,6 +530,28 @@ const isBun =
   typeof process !== "undefined" &&
   typeof (process.versions as Record<string, string> | undefined)?.bun === "string";
 
+// Keep native proxy calls below the global auth wrapper installed later in
+// this module. Otherwise a routed request would re-enter that wrapper forever.
+// Unwrap earlier activations as well so /reload does not build a wrapper chain.
+const GLOBAL_FETCH_FALLBACK = Symbol.for("pi-proxy-router.global-fetch-fallback");
+type ManagedGlobalFetch = typeof globalThis.fetch & {
+  [GLOBAL_FETCH_FALLBACK]?: typeof globalThis.fetch;
+};
+
+function unwrapGlobalFetch(current: typeof globalThis.fetch): typeof globalThis.fetch {
+  let base = current;
+  const seen = new Set<typeof globalThis.fetch>();
+  while (!seen.has(base)) {
+    seen.add(base);
+    const fallback = (base as ManagedGlobalFetch)[GLOBAL_FETCH_FALLBACK];
+    if (!fallback) break;
+    base = fallback;
+  }
+  return base;
+}
+
+const nativeFallbackFetch = unwrapGlobalFetch(globalThis.fetch);
+
 function makeBunProxyFetch(proxyUrl: string): NonNullable<StreamOptions["fetch"]> {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     // init.dispatcher targets npm undici; Bun's native fetch takes `proxy`.
@@ -536,7 +559,7 @@ function makeBunProxyFetch(proxyUrl: string): NonNullable<StreamOptions["fetch"]
       dispatcher?: unknown;
     };
     try {
-      return (await globalThis.fetch(input as never, {
+      return (await nativeFallbackFetch(input as never, {
         ...rest,
         proxy: proxyUrl,
       } as never)) as unknown as Response;
@@ -548,7 +571,7 @@ function makeBunProxyFetch(proxyUrl: string): NonNullable<StreamOptions["fetch"]
 }
 
 /** Fetch bound to a route decision's proxy (null = explicit direct connection). */
-export type RoutedFetch = (url: string, init?: RequestInit) => Promise<Response>;
+export type RoutedFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 // Under Bun an http(s) proxy goes through the native fetch `proxy` option;
 // everything else (socks5, explicit direct, or Node http proxies) uses npm
@@ -570,6 +593,48 @@ function makeRoutedFetch(proxyUrl: string | null): RoutedFetch {
       throw err;
     }
   }) as RoutedFetch;
+}
+
+// Pi's global fetch comes from its own bundled Undici instance. Setting the
+// global dispatcher on this extension's npm Undici copy cannot intercept it.
+// Wrap the actual global fetch for auth endpoints (and the existing endpoint
+// fallback / /allproxy behavior), delegating every other call to Pi's fetch.
+const globalFetchState: { applied: typeof globalThis.fetch | undefined } = {
+  applied: undefined,
+};
+
+function getFetchInputUrl(input: RequestInfo | URL): URL | null {
+  try {
+    if (input instanceof URL) return input;
+    if (typeof input === "string") return new URL(input);
+    return new URL(input.url);
+  } catch {
+    return null;
+  }
+}
+
+function ensureGlobalFetch(): void {
+  const current = globalThis.fetch;
+  if (current === globalFetchState.applied) return;
+  const fallback = unwrapGlobalFetch(current);
+  const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = getFetchInputUrl(input);
+    if (url && (url.protocol === "http:" || url.protocol === "https:")) {
+      const route = resolveGlobalRoute(activeNoproxyFlag, {
+        origin: url.origin,
+        path: url.pathname,
+      });
+      if (route.matched) {
+        log(`global fetch route: ${url.hostname}${url.pathname} -> ${displayProxyUrl(route.url)}`);
+        return makeRoutedFetch(route.url)(input, init);
+      }
+    }
+    return fallback(input, init);
+  }) as ManagedGlobalFetch;
+  Object.defineProperty(wrapped, GLOBAL_FETCH_FALLBACK, { value: fallback });
+  globalThis.fetch = wrapped;
+  globalFetchState.applied = wrapped;
+  log("global auth fetch installed");
 }
 
 // Per-model route decision plus the fetch bound to that route's dispatcher.
@@ -964,6 +1029,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   ensureGlobalDispatcher(noproxyFlag);
+  ensureGlobalFetch();
   ensureWebSocketFallback();
   publishBridge();
   const rules = loadRules();
