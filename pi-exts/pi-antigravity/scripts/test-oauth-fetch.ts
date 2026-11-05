@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici";
 import { refreshAntigravityToken } from "../src/auth/oauth.js";
@@ -14,6 +17,9 @@ const tokenBody = gzipSync(
 );
 const originalFetch = globalThis.fetch;
 const originalDispatcher = getGlobalDispatcher();
+const originalHome = process.env.HOME;
+const tempHome = mkdtempSync(join(tmpdir(), "antigravity-oauth-direct-"));
+process.env.HOME = tempHome;
 const mock = new MockAgent();
 mock.disableNetConnect();
 setGlobalDispatcher(mock);
@@ -51,7 +57,10 @@ try {
 } finally {
   globalThis.fetch = originalFetch;
   setGlobalDispatcher(originalDispatcher);
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
   await mock.close();
+  rmSync(tempHome, { recursive: true, force: true });
 }
 
 console.log("OAuth fetch gzip success/error and shared dispatcher tests passed");

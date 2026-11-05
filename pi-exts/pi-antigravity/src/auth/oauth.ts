@@ -1,23 +1,93 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:http";
-import { fetch as oauthFetch } from "undici";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
+import { join } from "node:path";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import { fetch as oauthFetch, ProxyAgent } from "undici";
 
-// Read proxy config from proxy-router.json for OAuth refresh
+// Read proxy config from proxy-router.json for OAuth requests.
 function getProxyUrlForAuth(provider: string): string | null {
   try {
     const configPath = join(homedir(), ".pi", "agent", "proxy-router.json");
-    const config = JSON.parse(readFileSync(configPath, "utf8"));
-    return config?.auth?.[provider] ?? null;
+    const config: unknown = JSON.parse(readFileSync(configPath, "utf8"));
+    if (!isRecord(config) || !isRecord(config.auth)) return null;
+    const proxyUrl = config.auth[provider];
+    return typeof proxyUrl === "string" ? proxyUrl : null;
   } catch {
     return null;
   }
 }
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+
+interface OAuthProxyAgentState {
+  agent: ProxyAgent;
+  activeRequests: number;
+  retired: boolean;
+  closePromise?: Promise<void>;
+}
+
+let oauthProxyAgentState: OAuthProxyAgentState | undefined;
+let oauthProxyAgentUrl: string | undefined;
+
+function closeRetiredOAuthProxyAgent(state: OAuthProxyAgentState): void {
+  if (!state.retired || state.activeRequests > 0 || state.closePromise) return;
+  state.closePromise = state.agent.close().catch(() => {});
+}
+
+function retireOAuthProxyAgent(state: OAuthProxyAgentState | undefined): void {
+  if (!state) return;
+  state.retired = true;
+  closeRetiredOAuthProxyAgent(state);
+}
+
+function getOAuthProxyAgentState(): OAuthProxyAgentState | undefined {
+  const proxyUrl = getProxyUrlForAuth("antigravity");
+  if (!proxyUrl) {
+    oauthProxyAgentUrl = undefined;
+    const previousState = oauthProxyAgentState;
+    oauthProxyAgentState = undefined;
+    retireOAuthProxyAgent(previousState);
+    return undefined;
+  }
+  if (oauthProxyAgentState && oauthProxyAgentUrl === proxyUrl) return oauthProxyAgentState;
+
+  const nextState: OAuthProxyAgentState = {
+    agent: new ProxyAgent(proxyUrl),
+    activeRequests: 0,
+    retired: false,
+  };
+  const previousState = oauthProxyAgentState;
+  oauthProxyAgentState = nextState;
+  oauthProxyAgentUrl = proxyUrl;
+  retireOAuthProxyAgent(previousState);
+
+  const parsedProxyUrl = new URL(proxyUrl);
+  console.error(
+    `[antigravity] OAuth proxy enabled: ${parsedProxyUrl.protocol}//${parsedProxyUrl.host}`,
+  );
+  return nextState;
+}
+
+async function fetchWithOAuthProxy(
+  input: Parameters<typeof oauthFetch>[0],
+  init: Parameters<typeof oauthFetch>[1] = {},
+) {
+  const proxyState = getOAuthProxyAgentState();
+  if (!proxyState) return oauthFetch(input, init);
+
+  // Fetch resolves after the final redirect's response headers arrive. Retiring an
+  // agent before then could reject a redirect dispatch; Undici's graceful close
+  // still waits for the response body after the final dispatch is released here.
+  proxyState.activeRequests += 1;
+  try {
+    return await oauthFetch(input, { ...init, dispatcher: proxyState.agent });
+  } finally {
+    proxyState.activeRequests -= 1;
+    closeRetiredOAuthProxyAgent(proxyState);
+  }
+}
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
-import { escapeHtml, antigravityEnv } from "../utils/util.js";
+import { escapeHtml, antigravityEnv, isRecord } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
 import type { AntigravityOAuthCredentials, CallbackServer } from "../types/types.js";
 
@@ -89,9 +159,12 @@ function generatePKCE(): { verifier: string; challenge: string } {
 
 async function getUserEmail(token: string): Promise<string | undefined> {
   try {
-    const res = await oauthFetch("https://www.googleapis.com/oauth2/v1/userinfo?alt=json", {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchWithOAuthProxy(
+      "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
     if (!res.ok) return undefined;
     const data = (await res.json()) as { email?: string };
     return data.email;
@@ -363,7 +436,7 @@ export async function loginAntigravity(
     });
     if (returnedState !== state) throw new Error("OAuth state mismatch");
 
-    const tokenResponse = await oauthFetch(TOKEN_URL, {
+    const tokenResponse = await fetchWithOAuthProxy(TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -412,41 +485,18 @@ export async function refreshAntigravityToken(
 ): Promise<AntigravityOAuthCredentials> {
   // SDK hosts may use Node 26 built-in fetch with a separate Undici dispatcher.
   // Use Undici's fetch to keep response decompression on the same implementation.
-  const proxyUrl = getProxyUrlForAuth("antigravity");
-  
   const postData = new URLSearchParams({
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
     refresh_token: credentials.refresh,
     grant_type: "refresh_token",
   }).toString();
-  
-  let response: { ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<any> };
-  try {
-    // Set proxy env temporarily for this OAuth refresh request
-    const oldHttpProxy = process.env.HTTP_PROXY;
-    const oldHttpsProxy = process.env.HTTPS_PROXY;
-    if (proxyUrl) {
-      process.env.HTTP_PROXY = proxyUrl;
-      process.env.HTTPS_PROXY = proxyUrl;
-    }
-    
-    try {
-      response = await oauthFetch(TOKEN_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: postData,
-      });
-    } finally {
-      // Restore env
-      if (oldHttpProxy !== undefined) process.env.HTTP_PROXY = oldHttpProxy;
-      else delete process.env.HTTP_PROXY;
-      if (oldHttpsProxy !== undefined) process.env.HTTPS_PROXY = oldHttpsProxy;
-      else delete process.env.HTTPS_PROXY;
-    }
-  } catch (err) {
-    throw err;
-  }
+
+  const response = await fetchWithOAuthProxy(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: postData,
+  });
   if (!response.ok) {
     throw new Error(
       `Antigravity token refresh failed: ${sanitizeOAuthProviderError(await response.text())}`,
