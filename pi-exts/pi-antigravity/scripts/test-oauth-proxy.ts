@@ -37,6 +37,15 @@ const proxyAgents: ProxyAgent[] = [];
 const closedProxyAgents: ProxyAgent[] = [];
 const proxyEnvDuringRequests: string[] = [];
 const logs: string[] = [];
+let pauseNextProxyDispatch = false;
+let notifyFirstRequestStarted!: () => void;
+const firstRequestStarted = new Promise<void>((resolve) => {
+  notifyFirstRequestStarted = resolve;
+});
+let releaseFirstResponse!: () => void;
+const firstResponseGate = new Promise<void>((resolve) => {
+  releaseFirstResponse = resolve;
+});
 const mock = new MockAgent();
 mock.disableNetConnect();
 
@@ -67,6 +76,12 @@ try {
   ProxyAgent.prototype.dispatch = function (options, handler) {
     if (!proxyAgents.includes(this)) proxyAgents.push(this);
     proxyDispatches.push(`${options.method} ${options.origin}${options.path}`);
+    if (pauseNextProxyDispatch) {
+      pauseNextProxyDispatch = false;
+      notifyFirstRequestStarted();
+      void firstResponseGate.then(() => mock.dispatch(options, handler));
+      return true;
+    }
     return mock.dispatch(options, handler);
   };
   ProxyAgent.prototype.close = function (...args: unknown[]) {
@@ -148,26 +163,11 @@ try {
   assert.ok(!logs.join("\n").includes("proxy-user"));
   assert.ok(!logs.join("\n").includes("proxy-pass"));
 
-  let notifyFirstRequestStarted!: () => void;
-  const firstRequestStarted = new Promise<void>((resolve) => {
-    notifyFirstRequestStarted = resolve;
-  });
-  let releaseFirstResponse!: () => void;
-  const firstResponseGate = new Promise<void>((resolve) => {
-    releaseFirstResponse = resolve;
-  });
+  pauseNextProxyDispatch = true;
   mock
     .get("https://oauth2.googleapis.com")
     .intercept({ path: "/token", method: "POST" })
-    .reply(async () => {
-      notifyFirstRequestStarted();
-      await firstResponseGate;
-      return {
-        statusCode: 200,
-        data: tokenResponse,
-        responseOptions: { headers: { "content-type": "application/json" } },
-      };
-    });
+    .reply(200, tokenResponse, { headers: { "content-type": "application/json" } });
 
   const firstAgent = proxyAgents[0];
   assert.ok(firstAgent);

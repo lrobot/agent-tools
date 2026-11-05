@@ -1,10 +1,18 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import { fetch as oauthFetch, ProxyAgent } from "undici";
+import type * as Undici from "undici";
+
+// Pi's Bun runtime aliases a bare "undici" import to its built-in copy, whose
+// fetch ignores ProxyAgent dispatchers. Resolve package.json first, then load
+// the npm package by its explicit path so OAuth requests use the configured proxy.
+const nodeRequire = createRequire(import.meta.url);
+const undiciDir = dirname(nodeRequire.resolve("undici/package.json"));
+const { fetch: oauthFetch, ProxyAgent } = nodeRequire(undiciDir) as typeof Undici;
 
 // Read proxy config from proxy-router.json for OAuth requests.
 function getProxyUrlForAuth(provider: string): string | null {
@@ -20,7 +28,7 @@ function getProxyUrlForAuth(provider: string): string | null {
 }
 
 interface OAuthProxyAgentState {
-  agent: ProxyAgent;
+  agent: Undici.ProxyAgent;
   activeRequests: number;
   retired: boolean;
   closePromise?: Promise<void>;
