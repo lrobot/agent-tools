@@ -70,8 +70,9 @@ async function loginAndRemember(
 
 async function refreshAndRemember(
   credentials: Parameters<typeof refreshAntigravityToken>[0],
+  signal?: AbortSignal,
 ): ReturnType<typeof refreshAntigravityToken> {
-  const refreshed = await refreshAntigravityToken(credentials);
+  const refreshed = await refreshAntigravityToken(credentials, signal);
   updateRememberedAccount(credentials, refreshed);
   return refreshed;
 }
