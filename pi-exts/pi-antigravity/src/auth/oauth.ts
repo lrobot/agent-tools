@@ -69,10 +69,12 @@ function getOAuthProxyAgentState(): OAuthProxyAgentState | undefined {
   oauthProxyAgentUrl = proxyUrl;
   retireOAuthProxyAgent(previousState);
 
-  const parsedProxyUrl = new URL(proxyUrl);
-  console.error(
-    `[antigravity] OAuth proxy enabled: ${parsedProxyUrl.protocol}//${parsedProxyUrl.host}`,
-  );
+  if (antigravityEnv("DEBUG") === "1") {
+    const parsedProxyUrl = new URL(proxyUrl);
+    console.error(
+      `[antigravity] OAuth proxy enabled: ${parsedProxyUrl.protocol}//${parsedProxyUrl.host}`,
+    );
+  }
   return nextState;
 }
 
@@ -103,9 +105,9 @@ export const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
 export const OAUTH_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+const OAUTH_REFRESH_TIMEOUT_MS = 10_000;
 export const SCOPES = [
   "https://www.googleapis.com/auth/aicode",
-const OAUTH_REFRESH_TIMEOUT_MS = 10_000;
   "https://www.googleapis.com/auth/cloud-platform",
   "https://www.googleapis.com/auth/userinfo.email",
   "https://www.googleapis.com/auth/userinfo.profile",
@@ -489,16 +491,16 @@ export async function loginAntigravity(
   }
 }
 
-export async function refreshAntigravityToken(
-  credentials: OAuthCredentials,
 function refreshRequestSignal(signal?: AbortSignal): AbortSignal {
   const timeoutSignal = AbortSignal.timeout(OAUTH_REFRESH_TIMEOUT_MS);
   return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 }
 
+export async function refreshAntigravityToken(
+  credentials: OAuthCredentials,
+  signal?: AbortSignal,
 ): Promise<AntigravityOAuthCredentials> {
   // SDK hosts may use Node 26 built-in fetch with a separate Undici dispatcher.
-  signal?: AbortSignal,
   // Use Undici's fetch to keep response decompression on the same implementation.
   const postData = new URLSearchParams({
     client_id: CLIENT_ID,
@@ -511,9 +513,9 @@ function refreshRequestSignal(signal?: AbortSignal): AbortSignal {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: postData,
+    signal: refreshRequestSignal(signal),
   });
   if (!response.ok) {
-    signal: refreshRequestSignal(signal),
     throw new Error(
       `Antigravity token refresh failed: ${sanitizeOAuthProviderError(await response.text())}`,
     );
