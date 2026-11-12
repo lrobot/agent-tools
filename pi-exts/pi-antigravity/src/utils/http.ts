@@ -1,4 +1,4 @@
-import { antigravityEnv } from "./util.js";
+import { antigravityEnv, isRecord } from "./util.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -7,8 +7,10 @@ import { homedir } from "node:os";
 function getProxyUrlForAuth(provider: string): string | null {
   try {
     const configPath = join(homedir(), ".pi", "agent", "proxy-router.json");
-    const config = JSON.parse(readFileSync(configPath, "utf8"));
-    return config?.auth?.[provider] ?? null;
+    const config: unknown = JSON.parse(readFileSync(configPath, "utf8"));
+    if (!isRecord(config) || !isRecord(config.auth)) return null;
+    const proxyUrl = config.auth[provider];
+    return typeof proxyUrl === "string" ? proxyUrl : null;
   } catch {
     return null;
   }

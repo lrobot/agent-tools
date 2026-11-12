@@ -43,6 +43,13 @@ import {
 } from "./usage/index.js";
 import { redactSecrets, maskEmail } from "./utils/index.js";
 
+type MultiAccountEventBridge = {
+  events?: {
+    emit?: (event: string, payload: unknown) => void;
+    on?: (event: string, listener: () => void) => void;
+  };
+};
+
 /**
  * Pi's interactive `notify` writes into the chat transcript. `console.log` in that
  * mode prints to the raw terminal and paints over the TUI. Use one channel only.
@@ -70,8 +77,9 @@ async function loginAndRemember(
 
 async function refreshAndRemember(
   credentials: Parameters<typeof refreshAntigravityToken>[0],
+  signal?: AbortSignal,
 ): ReturnType<typeof refreshAntigravityToken> {
-  const refreshed = await refreshAntigravityToken(credentials);
+  const refreshed = await refreshAntigravityToken(credentials, signal);
   updateRememberedAccount(credentials, refreshed);
   return refreshed;
 }
@@ -202,28 +210,37 @@ export default function (pi: ExtensionAPI): void {
     );
   }
 
+  const multiAccountEvents = (pi as unknown as MultiAccountEventBridge).events;
   const broadcastToMultiAccount = () => {
-    (pi as any).events?.emit?.("pi-multi-account:register-family", {
+    multiAccountEvents?.emit?.("pi-multi-account:register-family", {
       family: "antigravity",
       label: "Gemini",
       idPattern: /^antigravity(-account-\d+)?$/,
-      fetchUsageSnapshot: async (provider: string, _credential: any) => {
+      fetchUsageSnapshot: async (provider: string, _credential: unknown) => {
         const apiKey = await getApiKeyForSlot(provider);
         const usage = await fetchAccountUsage(apiKey);
         const geminiGroup = usage.groups?.find((g) => /gemini/i.test(g.displayName || ""));
-        const bucket5h = geminiGroup?.buckets?.find((b) => /5\s*h/i.test(b.displayName || b.window || ""));
-        const bucketWeekly = geminiGroup?.buckets?.find((b) => /week|7\s*d/i.test(b.displayName || b.window || ""));
+        const bucket5h = geminiGroup?.buckets?.find((b) =>
+          /5\s*h/i.test(b.displayName || b.window || ""),
+        );
+        const bucketWeekly = geminiGroup?.buckets?.find((b) =>
+          /week|7\s*d/i.test(b.displayName || b.window || ""),
+        );
         const primary = bucket5h
           ? {
               usedPercent: Math.round((1 - bucket5h.remainingFraction) * 100),
-              resetAt: bucket5h.resetTime ? Date.parse(bucket5h.resetTime) : Date.now() + 5 * 3600 * 1000,
+              resetAt: bucket5h.resetTime
+                ? Date.parse(bucket5h.resetTime)
+                : Date.now() + 5 * 3600 * 1000,
               windowSeconds: 5 * 3600,
             }
           : undefined;
         const secondary = bucketWeekly
           ? {
               usedPercent: Math.round((1 - bucketWeekly.remainingFraction) * 100),
-              resetAt: bucketWeekly.resetTime ? Date.parse(bucketWeekly.resetTime) : Date.now() + 7 * 24 * 3600 * 1000,
+              resetAt: bucketWeekly.resetTime
+                ? Date.parse(bucketWeekly.resetTime)
+                : Date.now() + 7 * 24 * 3600 * 1000,
               windowSeconds: 7 * 24 * 3600,
             }
           : undefined;
@@ -247,7 +264,7 @@ export default function (pi: ExtensionAPI): void {
   };
 
   broadcastToMultiAccount();
-  (pi as any).events?.on?.("pi-multi-account:ready", () => {
+  multiAccountEvents?.on?.("pi-multi-account:ready", () => {
     broadcastToMultiAccount();
   });
 

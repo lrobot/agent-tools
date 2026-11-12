@@ -192,6 +192,7 @@ All primary environment variables start with `ANTIGRAVITY_`. The legacy `NOAGY_`
 | `ANTIGRAVITY_CATALOG_REFRESH_INTERVAL_MS` | Override catalog refresh TTL in ms. Defaults to 4 hours (`14400000`). Set to `0` to always refresh. |
 | `ANTIGRAVITY_CLIENT_ID` | Use a custom Google OAuth client ID. |
 | `ANTIGRAVITY_CLIENT_SECRET` | Use a custom Google OAuth client secret. Keep it out of source control and shell history. |
+| `ANTIGRAVITY_DEBUG` | Set to `1` to enable diagnostic console logging, including the OAuth proxy activation notice. Logging is off by default; proxy routing is unaffected. |
 | `ANTIGRAVITY_NO_KEEPALIVE` | Set to `1` to skip the keep-alive connection pool. |
 | `ANTIGRAVITY_NO_PREWARM` | Set to `1` to skip the TLS pre-warm request made on the first Antigravity request. |
 | `ANTIGRAVITY_NO_EXTRA_TOOLS` | Set to `1` to stop registering the model-facing `google_search` and `generate_image` tools. The `/antigravity.search` and `/antigravity.image` commands stay available. |

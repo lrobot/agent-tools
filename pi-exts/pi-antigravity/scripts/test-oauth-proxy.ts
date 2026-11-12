@@ -31,6 +31,8 @@ const originalDispatcher = getGlobalDispatcher();
 const originalProxyDispatch = ProxyAgent.prototype.dispatch;
 const originalProxyClose = ProxyAgent.prototype.close;
 const originalConsoleError = console.error;
+const debugEnvNames = ["ANTIGRAVITY_DEBUG", "NOAGY_DEBUG"] as const;
+const originalDebugEnv = new Map(debugEnvNames.map((name) => [name, process.env[name]]));
 const tempHome = mkdtempSync(join(tmpdir(), "antigravity-oauth-proxy-"));
 const proxyDispatches: string[] = [];
 const proxyAgents: ProxyAgent[] = [];
@@ -59,6 +61,7 @@ try {
     }),
   );
   process.env.HOME = tempHome;
+  for (const name of debugEnvNames) delete process.env[name];
   for (const name of proxyEnvNames) {
     process.env[name] = "http://environment-proxy.invalid:8080";
   }
@@ -158,11 +161,13 @@ try {
   ]);
   assert.ok(proxyEnvDuringRequests.length > 0);
   assert.deepEqual(new Set(proxyEnvDuringRequests), new Set([expectedEnvSnapshot]));
-  const proxyLogs = logs.filter((line) => line.includes("http://127.0.0.1:7890"));
-  assert.equal(proxyLogs.length, 1);
-  assert.ok(!logs.join("\n").includes("proxy-user"));
-  assert.ok(!logs.join("\n").includes("proxy-pass"));
+  assert.equal(
+    logs.filter((line) => line.includes("OAuth proxy enabled")).length,
+    0,
+    "proxy activation must be quiet by default",
+  );
 
+  process.env.ANTIGRAVITY_DEBUG = "1";
   pauseNextProxyDispatch = true;
   mock
     .get("https://oauth2.googleapis.com")
@@ -175,7 +180,9 @@ try {
   await firstRequestStarted;
   writeFileSync(
     join(tempHome, ".pi", "agent", "proxy-router.json"),
-    JSON.stringify({ auth: { antigravity: "http://127.0.0.1:7891" } }),
+    JSON.stringify({
+      auth: { antigravity: "http://proxy-user:proxy-pass@127.0.0.1:7891" },
+    }),
   );
   mock
     .get("https://oauth2.googleapis.com")
@@ -183,6 +190,11 @@ try {
     .reply(200, tokenResponse, { headers: { "content-type": "application/json" } });
   const secondRefresh = await refreshAntigravityToken(credentials);
   assert.equal(secondRefresh.access, "new-access");
+  const proxyLogs = logs.filter((line) => line.includes("OAuth proxy enabled"));
+  assert.equal(proxyLogs.length, 1);
+  assert.match(proxyLogs[0] || "", /http:\/\/127\.0\.0\.1:7891/);
+  assert.ok(!logs.join("\n").includes("proxy-user"));
+  assert.ok(!logs.join("\n").includes("proxy-pass"));
   const secondAgent = proxyAgents[1];
   assert.ok(secondAgent);
   const firstAgentClosedWhilePending = closedProxyAgents.includes(firstAgent);
@@ -216,6 +228,11 @@ try {
   console.error = originalConsoleError;
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  for (const name of debugEnvNames) {
+    const value = originalDebugEnv.get(name);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
   for (const name of proxyEnvNames) {
     const value = originalEnv.get(name);
     if (value === undefined) delete process.env[name];
@@ -225,4 +242,6 @@ try {
   rmSync(tempHome, { recursive: true, force: true });
 }
 
-console.log("OAuth explicit ProxyAgent login, userinfo, refresh, and safe logging tests passed");
+console.log(
+  "OAuth explicit ProxyAgent login, userinfo, refresh, quiet default, and opt-in safe debug logging tests passed",
+);

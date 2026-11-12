@@ -55,6 +55,11 @@ exchange commits with upstreams:
 - Upstream histories appear as ordinary commits in `git log`; each subtree
   arrived in its own merge commit (see `git log --oneline --graph`).
 - Each upstream has a named remote in this repo (see `git remote -v`).
+- Subtree state verified 2026-11-11 for `pi-exts/pi-usage`: upstream history
+  merged via `51fcd4fc` (upstream v0.2.0 + proxy-router bridge) and `98fa21f9`
+  (vendor instances + OAuth accounts); all nested-repo commits are ancestors of
+  this repo's HEAD and the on-disk tree hash equals `HEAD:pi-exts/pi-usage`,
+  so the content is fully contained here (39 tracked files).
 - **Local modifications** to a subtree are committed on top, in this repo
   (currently: pi-antigravity per-provider proxy patch, pi-multi-account
   custom-family-registry, pi-proxy-router antigravity OAuth endpoints +
@@ -93,6 +98,15 @@ fork branch contains just the extension's own history + your changes.
 - `git subtree add` refuses a prefix that exists on disk, even as an
   untracked dir with identical content (git 2.54). Move the dir aside,
   add the subtree, then re-apply local changes.
+- A subtree dir must never contain a nested `.git` (e.g. left by a manual
+  clone or copy). It turns the dir into an invisible nested repository:
+  the parent's `git status` stays silent about it and `git -C <dir>` shows
+  the wrong history. Compare the tree hashes first
+  (`git -C <dir> rev-parse 'HEAD^{tree}'` vs parent
+  `git rev-parse 'HEAD:pi-exts/<name>'`), then delete the nested `.git`
+  once they match — the subtree files stay tracked in this repo.
+  (Done for pi-usage on 2026-11-11; its nested `.git` had no commits that
+  were missing here.)
 - Never `--squash` a subtree you intend to `subtree push` later.
 - `node_modules/` is gitignored everywhere; after a fresh clone run
   `bun install` in `pi-exts/pi-yaml-providers` (and the subtree dirs that

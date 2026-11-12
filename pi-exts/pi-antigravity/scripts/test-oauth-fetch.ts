@@ -53,6 +53,14 @@ try {
       headers: { "content-type": "application/json", "content-encoding": "gzip" },
     });
   await assert.rejects(refreshAntigravityToken(credentials), /invalid_grant/);
+
+  const controller = new AbortController();
+  controller.abort(new Error("refresh cancelled by test"));
+  await assert.rejects(
+    refreshAntigravityToken(credentials, controller.signal),
+    /refresh cancelled by test/,
+  );
+
   mock.assertNoPendingInterceptors();
 } finally {
   globalThis.fetch = originalFetch;
