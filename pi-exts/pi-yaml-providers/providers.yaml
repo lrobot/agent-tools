@@ -97,10 +97,13 @@ xiaomi:
   base_url: "https://api.xiaomimimo.com"
   base_url_v1: "https://api.xiaomimimo.com/v1"
   documentation: "https://mimo.mi.com/docs/"
-  models:
-    mimo-v2-5-pro: "mimo-v2.5-pro"
-    mimo-v2-5: "mimo-v2.5"
-    mimo-v2-5-asr: "mimo-v2.5-asr"
+xmplan:
+  name: "Xiaomi MiMo (小米大模型开放平台)"
+  max_context_ref: "https://models.dev/api.json"
+  base_url: "https://token-plan-cn.xiaomimimo.com/anthropic"
+  base_url_v1: "https://token-plan-cn.xiaomimimo.com/anthropic/v1"
+  models_url: "https://token-plan-cn.xiaomimimo.com/v1/models"
+  documentation: "https://platform.xiaomimimo.com/console/plan-manage?edition=PERSONAL"
 google:
   name: "Google Gemini"
   base_url: "https://generativelanguage.googleapis.com/v1beta"
