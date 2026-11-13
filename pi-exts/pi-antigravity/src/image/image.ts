@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   antigravityHeaders,
@@ -7,7 +8,9 @@ import {
   jsonOrTextError,
   parseApiKey,
 } from "../client/client.js";
+import { resolveEnterpriseTarget } from "../client/enterprise.js";
 import { AntigravityRequestType, AntigravityUserAgent, GeminiRole } from "../types/enums.js";
+import { isCreditsEnabled } from "../utils/credits.js";
 import { antigravityFetch } from "../utils/http.js";
 import { safeError } from "../utils/security.js";
 import { sanitizeText } from "../utils/util.js";
@@ -50,6 +53,7 @@ export type ImageGenerateRequest = {
   requestType: "image_gen";
   userAgent: "antigravity";
   requestId: string;
+  enabledCreditTypes?: string[];
 };
 
 export type ImageCommandArgs = {
@@ -62,6 +66,7 @@ export type ImageCommandArgs = {
 export type GenerateImageOptions = ImageCommandArgs & {
   apiKey: string;
   cwd: string;
+  inputImages?: GeneratedImage[];
   signal?: AbortSignal;
 };
 
@@ -177,7 +182,7 @@ export function buildImageGenerateRequest(
   aspectRatio: string,
   inputImages: GeneratedImage[] = [],
 ): ImageGenerateRequest {
-  return {
+  const req: ImageGenerateRequest = {
     project: projectId,
     model,
     request: {
@@ -199,6 +204,10 @@ export function buildImageGenerateRequest(
     userAgent: AntigravityUserAgent.Antigravity,
     requestId: `image_gen/${Date.now()}/${randomUUID()}/1`,
   };
+  if (isCreditsEnabled()) {
+    req.enabledCreditTypes = ["GOOGLE_ONE_AI"];
+  }
+  return req;
 }
 
 function collectImagesFromParts(
@@ -288,19 +297,61 @@ export function parseImageResponse(chunk: ImageStreamChunk): {
   return { images, text };
 }
 
-async function writeImage(filePath: string, image: GeneratedImage): Promise<string> {
-  await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, Buffer.from(image.data, "base64"));
+export async function writeImage(
+  filePath: string,
+  image: GeneratedImage,
+  cwd: string,
+): Promise<string> {
+  const root = await realpath(cwd);
+  const rel = relative(resolve(cwd), filePath);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error("Image path must stay inside the working directory");
+  }
+  let parent = root;
+  for (const component of relative(resolve(cwd), dirname(filePath)).split(sep).filter(Boolean)) {
+    parent = join(parent, component);
+    try {
+      await mkdir(parent);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const info = await lstat(parent);
+    if (info.isSymbolicLink() || !info.isDirectory())
+      throw new Error("Image path must not traverse symlinks");
+  }
+  const target = join(root, rel);
+  try {
+    if ((await lstat(target)).isSymbolicLink())
+      throw new Error("Image path must not follow symlinks");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const handle = await open(
+    target,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await handle.writeFile(Buffer.from(image.data, "base64"));
+  } finally {
+    await handle.close();
+  }
   return filePath;
 }
 
 /** Generates in-memory content shared by the native API and file-saving wrapper. */
 export async function generateAntigravityImageContent(
-  options: Omit<GenerateImageOptions, "cwd" | "path"> & { inputImages?: GeneratedImage[] },
+  options: Omit<GenerateImageOptions, "cwd" | "path">,
 ): Promise<Omit<GenerateImageResult, "savedPaths">> {
   const prompt = options.prompt.trim();
   if (!prompt && !options.inputImages?.length)
     throw new Error("Image prompt or input image is required.");
+  const enterprise = resolveEnterpriseTarget();
+  if (enterprise) {
+    throw new Error(
+      `Image generation is not sent while Gemini Enterprise routing is active (location=${enterprise.location}). Google documents image generation on the global deployment only, and this extension does not upload prompts or reference images to a second host.`,
+    );
+  }
   if (prompt.length > MAX_PROMPT_CHARS) {
     throw new Error(`Image prompt is too long (max ${MAX_PROMPT_CHARS} characters).`);
   }
@@ -368,6 +419,7 @@ export async function generateAntigravityImage(
           result.images.length > 1 ? index : undefined,
         ),
         image,
+        options.cwd,
       ),
     );
   }

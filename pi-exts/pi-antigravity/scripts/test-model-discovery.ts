@@ -18,6 +18,7 @@ import {
   applyAntigravityCatalog,
   buildAntigravityCatalog,
   clearModelEnumCache,
+  extractRecommendedModelIds,
   getAntigravityRequestModelId,
   getFallbackRuntimeModel,
   getModelEnum,
@@ -103,6 +104,34 @@ try {
 }
 
 const knownId = ANTIGRAVITY_MODELS[0].id;
+// A resumed session may still select a static model removed by live curation.
+try {
+  const active = buildAntigravityCatalog(
+    { "gemini-3.8-flash-low": info("Gemini 3.8 Flash (Low)") },
+    fallback,
+  );
+  applyAntigravityCatalog(active);
+  for (const retired of ["gemini-3.6-flash", "gemini-3.7-flash"]) {
+    assert.throws(
+      () => getAntigravityRequestModelId(retired, "medium"),
+      /absent from the current catalog.*\/antigravity.refresh/,
+      "retired selections must not recover static runtime routes",
+    );
+  }
+  assert.equal(getAntigravityRequestModelId("gemini-3.8-flash", "medium"), "gemini-3.8-flash-low");
+  assert.equal(getAntigravityRequestModelId("custom-runtime", "medium"), "custom-runtime");
+  assert.equal(getFallbackRuntimeModel("gemini-3.8-flash-low"), undefined);
+  assert.equal(getFallbackRuntimeModel("gemini-3.7-flash-tiered", "medium"), undefined);
+  applyAntigravityCatalog(buildAntigravityCatalog({
+    "gemini-3.8-flash-low": info("Gemini 3.8 Flash (Low)"),
+    "gemini-3.7-flash-low": info("Gemini 3.7 Flash (Low)"),
+  }, fallback));
+  assert.equal(getFallbackRuntimeModel("gemini-3.8-flash-low"), "gemini-3.7-flash-low");
+} finally {
+  resetAntigravityCatalogForTests();
+}
+assert.equal(getAntigravityRequestModelId("gemini-3.6-flash", "medium"), "gemini-3.6-flash-medium");
+
 const updated = buildAntigravityCatalog(
   {
     [knownId + "-low"]: info("Updated model (Low)", {
@@ -603,5 +632,139 @@ try {
   resetAntigravityCatalogForTests();
   clearModelEnumCache();
 }
+
+// Curation via agentModelSorts (#97): active models prioritized, retired routes hidden
+const sortsPayload = [
+  {
+    displayName: "Recommended",
+    groups: [
+      {
+        modelIds: [
+          "gemini-4-argon-medium",
+          "gemini-4-argon-high",
+          "gemini-4-argon-low",
+          "gemini-3.8-flash-high",
+          "gemini-3.8-flash-medium",
+          "gemini-3.8-flash-low",
+        ],
+      },
+    ],
+  },
+];
+const recommendedSet = extractRecommendedModelIds(sortsPayload);
+assert.equal(recommendedSet?.size, 6);
+assert.ok(recommendedSet?.has("gemini-4-argon-medium"));
+assert.equal(extractRecommendedModelIds(undefined), undefined);
+assert.equal(extractRecommendedModelIds([]), undefined);
+
+const mixedRawModels: Record<string, ModelInfoRaw> = {
+  "gemini-4-argon-low": info("Gemini 4 Argon (Low)"),
+  "gemini-4-argon-medium": info("Gemini 4 Argon (Medium)"),
+  "gemini-4-argon-high": info("Gemini 4 Argon (High)"),
+  "gemini-3.8-flash-low": info("Gemini 3.8 Flash (Low)"),
+  "gemini-3.8-flash-medium": info("Gemini 3.8 Flash (Medium)"),
+  "gemini-3.8-flash-high": info("Gemini 3.8 Flash (High)"),
+  "gemini-pro-agent": info("Gemini Pro Agent (High)"),
+  "gemini-2.5-flash-low": info("Gemini 2.5 Flash (Low)"),
+  "gemini-3.1-pro-low": info("Gemini 3.1 Pro (Low)"),
+};
+
+const curatedCatalog = buildAntigravityCatalog(mixedRawModels, fallback, sortsPayload);
+const curatedIds = curatedCatalog.models.map((m) => m.id);
+assert.deepEqual(curatedIds.sort(), ["gemini-3.8-flash", "gemini-4-argon"].sort());
+assert.ok(!curatedCatalog.routing["gemini-pro-agent"], "hides retired gemini-pro-agent");
+assert.ok(!curatedCatalog.routing["gemini-2.5-flash"], "hides retired 2.5 variants");
+assert.ok(!curatedCatalog.routing["gemini-3.1-pro"], "hides retired 3.1 variants");
+
+// MergeAvailableModels carries agentModelSorts through
+const mergedWithSorts = mergeAvailableModelsResults([
+  {
+    endpoint: "https://cloudcode-pa.googleapis.com",
+    status: 200,
+    data: {
+      models: { "gemini-4-argon-low": info("Gemini 4 Argon (Low)") },
+      agentModelSorts: sortsPayload,
+    },
+  },
+]);
+assert.deepEqual(mergedWithSorts.data.agentModelSorts, sortsPayload);
+
+// Staggered rollouts (#123): a model recommended only by an earlier endpoint
+// (Gemini 4 Carbon launched on daily/sandbox before prod) must survive the
+// merge. A last-endpoint-wins merge hides it even though `models` is a union.
+const stagedRollout = mergeAvailableModelsResults([
+  {
+    endpoint: "https://daily-cloudcode-pa.googleapis.com",
+    status: 200,
+    data: {
+      models: {
+        "gemini-4-carbon-low": info("Gemini 4 Carbon (Low)"),
+        "gemini-4-carbon-medium": info("Gemini 4 Carbon (Medium)"),
+        "gemini-4-carbon-high": info("Gemini 4 Carbon (High)"),
+        "gemini-4-argon-medium": info("Gemini 4 Argon (Medium)"),
+      },
+      agentModelSorts: [
+        {
+          displayName: "Recommended",
+          groups: [
+            {
+              modelIds: [
+                "gemini-4-carbon-medium",
+                "gemini-4-carbon-high",
+                "gemini-4-carbon-low",
+                "gemini-4-argon-medium",
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    endpoint: "https://cloudcode-pa.googleapis.com",
+    status: 200,
+    data: {
+      models: { "gemini-4-argon-medium": info("Gemini 4 Argon (Medium)") },
+      agentModelSorts: [
+        { displayName: "Recommended", groups: [{ modelIds: ["gemini-4-argon-medium"] }] },
+      ],
+    },
+  },
+]);
+assert.deepEqual(
+  stagedRollout.data.agentModelSorts?.[0]?.groups?.[0]?.modelIds,
+  [
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-low",
+    "gemini-4-argon-medium",
+  ],
+  "unions recommendation lists and keeps the primary endpoint's ranking",
+);
+assert.deepEqual(
+  extractRecommendedModelIds(stagedRollout.data.agentModelSorts),
+  new Set([
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-low",
+    "gemini-4-argon-medium",
+  ]),
+);
+const stagedCatalog = buildAntigravityCatalog(
+  stagedRollout.data.models,
+  fallback,
+  stagedRollout.data.agentModelSorts,
+);
+assert(
+  stagedCatalog.models.some((model) => model.id === "gemini-4-carbon"),
+  "staged-rollout model stays selectable when any endpoint recommends it",
+);
+assert.equal(
+  mergeAvailableModelsResults([
+    { endpoint: "a", status: 200, data: { models: { "gemini-4-argon-low": info("Argon (Low)") } } },
+  ]).data.agentModelSorts,
+  undefined,
+  "endpoints without recommendation lists stay undefined",
+);
 
 console.log("model discovery: live metadata, routing, validation, persistence, and TTL passed");

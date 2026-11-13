@@ -14,12 +14,15 @@ import {
   setLastStatus,
 } from "../diagnostics/diagnostics.js";
 import { isRecord } from "../utils/util.js";
+import { getCreditsStatus } from "../utils/credits.js";
 import { safeError } from "../utils/security.js";
 import { antigravityFetch } from "../utils/http.js";
+import { extractRecommendedModelIds } from "../models/grouping.js";
 import type {
   AccountUsage,
   ApiErrorBody,
   AvailableModelsRaw,
+  CreditBalanceInfo,
   LoadCodeAssistRaw,
   ModelQuotaRow,
   QuotaBucket,
@@ -142,10 +145,12 @@ function parseQuotaSummary(data: unknown): { groups: QuotaGroup[]; description?:
 function parseModels(data: unknown): {
   models: ModelQuotaRow[];
   defaultAgentModelId?: string;
+  agentModelSorts?: unknown;
 } {
   const raw = (isRecord(data) ? data : {}) as AvailableModelsRaw;
   const modelsObj = raw.models && isRecord(raw.models) ? raw.models : {};
   const models: ModelQuotaRow[] = [];
+  const recommendedIds = extractRecommendedModelIds(raw.agentModelSorts);
   for (const [modelId, info] of Object.entries(modelsObj)) {
     if (!info || !isRecord(info)) continue;
     if (info.isInternal || String(modelId).startsWith("chat_")) continue;
@@ -170,7 +175,7 @@ function parseModels(data: unknown): {
             : undefined,
       supportsThinking: !!info.supportsThinking,
       supportsImages: !!info.supportsImages,
-      recommended: !!info.recommended,
+      recommended: !!info.recommended || (recommendedIds?.has(modelId) ?? false),
     });
   }
   models.sort((a, b) => a.modelId.localeCompare(b.modelId));
@@ -180,17 +185,41 @@ function parseModels(data: unknown): {
       raw.defaultAgentModelId || raw.defaultAgentModel
         ? String(raw.defaultAgentModelId || raw.defaultAgentModel)
         : undefined,
+    agentModelSorts: raw.agentModelSorts,
   };
+}
+
+export function parseCredits(list: unknown): CreditBalanceInfo[] | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const result: CreditBalanceInfo[] = [];
+  for (const item of list) {
+    if (!item || !isRecord(item)) continue;
+    const amt = item.creditAmount ?? item.credit_amount;
+    const min = item.minimumCreditAmountForUsage ?? item.minimum_credit_amount_for_usage;
+    const typ = item.creditType ?? item.credit_type;
+    const num = typeof amt === "number" ? amt : typeof amt === "string" ? Number(amt) : undefined;
+    if (num !== undefined && Number.isFinite(num)) {
+      result.push({
+        creditType: typeof typ === "string" ? typ : "GOOGLE_ONE_AI",
+        creditAmount: num,
+        minimumCreditAmountForUsage:
+          typeof min === "number" ? min : typeof min === "string" ? Number(min) : undefined,
+      });
+    }
+  }
+  return result.length ? result : undefined;
 }
 
 function parseTier(value: unknown): TierInfo | undefined {
   if (!isRecord(value)) return undefined;
   const tier = value as TierRaw;
   if (!tier.id && !tier.name) return undefined;
+  const credits = parseCredits(tier.availableCredits ?? tier.available_credits);
   return {
     id: tier.id ? String(tier.id) : undefined,
     name: tier.name ? String(tier.name) : undefined,
     description: tier.description ? String(tier.description) : undefined,
+    availableCredits: credits,
   };
 }
 
@@ -260,11 +289,15 @@ export async function fetchAccountUsage(apiKeyRaw?: string): Promise<AccountUsag
   const { groups, description } = summary
     ? parseQuotaSummary(summary.data)
     : { groups: [], description: undefined };
-  const { models, defaultAgentModelId } = parseModels(available.data);
+  const { models, defaultAgentModelId, agentModelSorts } = parseModels(available.data);
 
   const assistData = (isRecord(assistResult?.data) ? assistResult.data : {}) as LoadCodeAssistRaw;
   const productTier = parseTier(assistData.currentTier);
   const paidTier = parseTier(assistData.paidTier);
+  const availableCredits =
+    paidTier?.availableCredits ??
+    productTier?.availableCredits ??
+    parseCredits(assistData.availableCredits ?? assistData.available_credits);
 
   // Google returns currentTier=free-tier even for Google AI Pro accounts.
   // The real subscription lives in paidTier (e.g. g1-pro-tier / Google AI Pro).
@@ -280,11 +313,13 @@ export async function fetchAccountUsage(apiKeyRaw?: string): Promise<AccountUsag
     productTier,
     paidTier,
     planLabel,
+    availableCredits,
     groups,
     groupDescription: description,
     quotaSummaryError,
     models,
     defaultAgentModelId,
+    agentModelSorts,
     fetchedAt: Date.now(),
   };
 }
@@ -324,6 +359,34 @@ export function formatUsageSummary(usage: AccountUsage): string {
   return lines.join("\n").trimEnd();
 }
 
+export async function fetchRemainingCredits(apiKeyRaw?: string): Promise<{
+  availableCredits?: CreditBalanceInfo[];
+  overagesEnabled: boolean;
+  planLabel?: string;
+}> {
+  const creds = parseApiKey(apiKeyRaw);
+  const assistResult = await loadCodeAssistSafe(creds.token);
+  const assistData = (isRecord(assistResult?.data) ? assistResult.data : {}) as LoadCodeAssistRaw;
+  const productTier = parseTier(assistData.currentTier);
+  const paidTier = parseTier(assistData.paidTier);
+  const availableCredits =
+    paidTier?.availableCredits ??
+    productTier?.availableCredits ??
+    parseCredits(assistData.availableCredits ?? assistData.available_credits);
+  const status = getCreditsStatus();
+  const planLabel = paidTier?.name
+    ? `${paidTier.name}${paidTier.id ? ` (${paidTier.id})` : ""}`
+    : productTier?.name
+      ? `${productTier.name}${productTier.id ? ` (${productTier.id})` : ""}`
+      : undefined;
+
+  return {
+    availableCredits,
+    overagesEnabled: status.enabled,
+    planLabel,
+  };
+}
+
 export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }): string {
   const lines: string[] = [];
   lines.push("Antigravity available models");
@@ -331,9 +394,12 @@ export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }):
   if (usage.defaultAgentModelId) lines.push(`defaultAgentModel=${usage.defaultAgentModelId}`);
   lines.push("");
 
+  const recommendedIds = extractRecommendedModelIds(usage.agentModelSorts);
   const rows = opts?.all
     ? usage.models
-    : usage.models.filter((m) => !/tab_|chat_/i.test(m.modelId));
+    : recommendedIds && recommendedIds.size > 0
+      ? usage.models.filter((m) => recommendedIds.has(m.modelId))
+      : usage.models.filter((m) => !/tab_|chat_/i.test(m.modelId));
 
   if (!rows.length) {
     lines.push("No models returned.");

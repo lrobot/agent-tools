@@ -126,6 +126,7 @@ export type AntigravityGenerateRequest = {
   requestType: "agent";
   userAgent: "antigravity";
   requestId: string;
+  enabledCreditTypes?: string[];
 };
 
 export type StreamPart = {
@@ -155,11 +156,15 @@ export type StreamCandidate = {
 export type StreamResponseData = {
   candidates?: StreamCandidate[];
   usageMetadata?: StreamUsageMetadata;
+  modelVersion?: string;
+  responseId?: string;
 };
 
 export type StreamChunk = StreamResponseData & {
   error?: { message?: string; code?: number };
   response?: StreamResponseData;
+  consumedCredits?: unknown;
+  remainingCredits?: unknown;
 };
 
 export type LooseImageBlock = {
@@ -203,10 +208,17 @@ export type ModelQuotaRow = {
   recommended?: boolean;
 };
 
+export type CreditBalanceInfo = {
+  creditType?: string;
+  creditAmount?: number;
+  minimumCreditAmountForUsage?: number;
+};
+
 export type TierInfo = {
   id?: string;
   name?: string;
   description?: string;
+  availableCredits?: CreditBalanceInfo[];
 };
 
 export type AccountUsage = {
@@ -216,12 +228,14 @@ export type AccountUsage = {
   productTier?: TierInfo;
   paidTier?: TierInfo;
   planLabel?: string;
+  availableCredits?: CreditBalanceInfo[];
   groups: QuotaGroup[];
   groupDescription?: string;
   /** Set when the (subscription-gated) quota-summary RPC was unavailable, e.g. free-tier SUBSCRIPTION_REQUIRED. */
   quotaSummaryError?: string;
   models: ModelQuotaRow[];
   defaultAgentModelId?: string;
+  agentModelSorts?: unknown;
   fetchedAt: number;
 };
 
@@ -269,19 +283,42 @@ export type ModelInfoRaw = {
   };
 };
 
+export type AgentModelSortGroup = {
+  modelIds?: unknown;
+};
+
+export type AgentModelSort = {
+  displayName?: unknown;
+  groups?: AgentModelSortGroup[];
+};
+
 export type AvailableModelsRaw = {
   models?: Record<string, ModelInfoRaw>;
   defaultAgentModelId?: unknown;
   defaultAgentModel?: unknown;
+  agentModelSorts?: AgentModelSort[];
+};
+
+export type CreditEntryRaw = {
+  creditType?: unknown;
+  credit_type?: unknown;
+  creditAmount?: unknown;
+  credit_amount?: unknown;
+  minimumCreditAmountForUsage?: unknown;
+  minimum_credit_amount_for_usage?: unknown;
 };
 
 export type TierRaw = {
   id?: unknown;
   name?: unknown;
   description?: unknown;
+  availableCredits?: CreditEntryRaw[];
+  available_credits?: CreditEntryRaw[];
 };
 
 export type LoadCodeAssistRaw = {
   currentTier?: TierRaw;
   paidTier?: TierRaw;
+  availableCredits?: CreditEntryRaw[];
+  available_credits?: CreditEntryRaw[];
 };
